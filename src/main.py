@@ -1,0 +1,254 @@
+import asyncio
+import logging
+import os
+import signal
+import sys
+
+from src.config import init_config, get_config, get_env
+from src.services.database import init_db, close_db
+from src.users.manager import UserManager
+from src.session.manager import SessionManager
+from src.agent.runner import AgentRunner
+from src.channels.base import IncomingMessage
+from src.channels.qq.bot import QQBot
+from src.scheduler.manager import TaskScheduler
+from src.services.internal_api import start_internal_api, stop_internal_api
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("claude-agent")
+
+
+class Application:
+    def __init__(self):
+        self.user_mgr = UserManager()
+        self.session_mgr: SessionManager | None = None
+        self.agent: AgentRunner | None = None
+        self.qq_bot: QQBot | None = None
+        self.scheduler: TaskScheduler | None = None
+        self._processing = set()
+
+    async def start(self):
+        init_config()
+        config = get_config()
+        env = get_env()
+
+        await init_db(config.database_path)
+
+        await self.user_mgr.ensure_admin(env.admin_qq_id, env.admin_password)
+
+        self.session_mgr = SessionManager(
+            ttl_hours=config.session.ttl_hours,
+            max_history=config.session.max_history,
+        )
+        self.agent = AgentRunner()
+
+        self.qq_bot = QQBot(
+            ws_url=config.napcat.ws_url,
+            http_url=config.napcat.http_url,
+        )
+
+        self.scheduler = TaskScheduler()
+        self.scheduler.set_send_func(self._scheduler_send)
+
+        await self.qq_bot.start(on_message=self.handle_message)
+        await self.scheduler.start()
+
+        start_internal_api(self)
+
+        logger.info("Application started successfully")
+
+    async def stop(self):
+        logger.info("Shutting down...")
+        stop_internal_api()
+        if self.qq_bot:
+            await self.qq_bot.stop()
+        if self.scheduler:
+            await self.scheduler.stop()
+        await close_db()
+        logger.info("Application stopped")
+
+    async def handle_message(self, msg: IncomingMessage):
+        task = asyncio.create_task(self._process_message(msg))
+        self._processing.add(task)
+        task.add_done_callback(self._processing.discard)
+
+    async def _process_message(self, msg: IncomingMessage):
+        user = await self.user_mgr.get_by_qq_id(msg.user_id)
+        if not user:
+            logger.info("Unauthorized QQ user: %s", msg.user_id)
+            if not msg.is_group:
+                await self.qq_bot.send_text(
+                    msg.session_key, "抱歉，您不在授权用户名单中。"
+                )
+            return
+
+        if msg.content.startswith("/"):
+            handled = await self._handle_command(msg, user)
+            if handled:
+                return
+
+        session = await self.session_mgr.get_or_create(
+            user_id=user["id"],
+            channel=msg.channel,
+            channel_session_id=msg.session_key,
+        )
+
+        history = await self.session_mgr.get_history(session["id"])
+        await self.session_mgr.append_message(session["id"], "user", msg.content)
+
+        logger.info(
+            "Processing: user=%s(%s), session=%s, msg=%s",
+            user["nickname"], msg.user_id, session["id"], msg.content[:50],
+        )
+
+        await self.qq_bot.send_text(msg.session_key, "正在思考中...", reply_to=msg.message_id)
+
+        import time
+        last_progress_time = 0.0
+
+        async def on_progress(kind: str, text: str):
+            nonlocal last_progress_time
+            now = time.monotonic()
+            if now - last_progress_time < 8:
+                return
+            last_progress_time = now
+            await self.qq_bot.send_text(msg.session_key, text, reply_to=msg.message_id)
+
+        reply = await self.agent.run(
+            user_message=msg.content,
+            history=history,
+            on_progress=on_progress,
+            scheduler=self.scheduler,
+            user=user,
+            session_key=msg.session_key,
+            workspace_id=msg.workspace_id,
+        )
+
+        await self.session_mgr.append_message(session["id"], "assistant", reply)
+        await self.qq_bot.send_text(msg.session_key, reply, reply_to=msg.message_id)
+
+    async def _handle_command(self, msg: IncomingMessage, user: dict) -> bool:
+        parts = msg.content.strip().split(maxsplit=1)
+        cmd = parts[0].lower()
+        args = parts[1] if len(parts) > 1 else ""
+
+        if cmd == "/help":
+            help_text = (
+                "可用命令:\n"
+                "/help - 显示帮助\n"
+                "/clear - 清空当前会话历史\n"
+                "/new - 新会话（清历史 + 清工作区文件）\n"
+                "/tasks - 查看我的定时任务\n"
+                "/model - 查看当前模型配置"
+            )
+            if user["role"] == "admin":
+                help_text += (
+                    "\n\n管理员命令:\n"
+                    "/adduser <QQ号> <密码> [昵称] - 添加用户\n"
+                    "/users - 查看所有用户"
+                )
+            await self.qq_bot.send_text(msg.session_key, help_text)
+            return True
+
+        if cmd in ("/clear", "/new"):
+            session = await self.session_mgr.get_or_create(
+                user["id"], msg.channel, msg.session_key
+            )
+            await self.session_mgr.clear_session(session["id"])
+            result = "会话已清空 ✓"
+
+            if cmd == "/new":
+                import shutil
+                workspace_id = f"group_{msg.group_id}" if msg.is_group else msg.user_id
+                workspace_dir = f"/app/data/workspace/{workspace_id}"
+                if os.path.isdir(workspace_dir):
+                    shutil.rmtree(workspace_dir)
+                    os.makedirs(workspace_dir, exist_ok=True)
+                result += "\n工作区文件已清空 ✓"
+
+            await self.qq_bot.send_text(msg.session_key, result)
+            return True
+
+        if cmd == "/tasks":
+            tasks = await self.scheduler.list_tasks(owner_id=user["id"])
+            if not tasks:
+                await self.qq_bot.send_text(msg.session_key, "暂无定时任务")
+            else:
+                lines = ["📋 我的任务:"]
+                for t in tasks:
+                    lines.append(f"  [{t['id']}] {t['name']} - {t['cron_expr']} - {t['status']}")
+                await self.qq_bot.send_text(msg.session_key, "\n".join(lines))
+            return True
+
+        if cmd == "/model":
+            config = get_config()
+            await self.qq_bot.send_text(
+                msg.session_key,
+                f"当前模型: {config.model.name}\nMax turns: {config.model.max_turns}",
+            )
+            return True
+
+        if cmd == "/adduser" and user["role"] == "admin":
+            return await self._cmd_adduser(msg, args)
+
+        if cmd == "/users" and user["role"] == "admin":
+            users = await self.user_mgr.list_users()
+            lines = ["👥 用户列表:"]
+            for u in users:
+                status = "✓" if u["is_active"] else "✗"
+                lines.append(f"  {status} {u['qq_id']} ({u['nickname']}) [{u['role']}]")
+            await self.qq_bot.send_text(msg.session_key, "\n".join(lines))
+            return True
+
+        return False
+
+    async def _cmd_adduser(self, msg: IncomingMessage, args: str) -> bool:
+        parts = args.split()
+        if len(parts) < 2:
+            await self.qq_bot.send_text(
+                msg.session_key, "用法: /adduser <QQ号> <密码> [昵称]"
+            )
+            return True
+
+        qq_id, password = parts[0], parts[1]
+        nickname = parts[2] if len(parts) > 2 else ""
+
+        existing = await self.user_mgr.get_by_qq_id(qq_id)
+        if existing:
+            await self.qq_bot.send_text(msg.session_key, f"用户 {qq_id} 已存在")
+            return True
+
+        await self.user_mgr.create_user(qq_id, password, nickname)
+        await self.qq_bot.send_text(msg.session_key, f"用户已添加: {qq_id} ✓")
+        return True
+
+    async def _scheduler_send(self, channel: str, target_id: str, text: str):
+        if channel == "qq" and self.qq_bot:
+            if target_id.startswith("group:"):
+                await self.qq_bot.send_group_text(target_id[6:], text)
+            else:
+                await self.qq_bot.send_private_text(target_id, text)
+
+
+async def main():
+    app = Application()
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: asyncio.create_task(app.stop()))
+
+    try:
+        await app.start()
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        await app.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

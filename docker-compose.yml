@@ -1,0 +1,38 @@
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: always
+    environment:
+      - NAPCAT_GID=1000
+      - NAPCAT_UID=1000
+    ports:
+      - "6099:6099"
+    volumes:
+      - napcat_config:/app/napcat/config
+      - napcat_data:/app/.config/QQ
+    networks:
+      - agent-net
+
+  claude-agent:
+    build: .
+    container_name: claude-agent
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./config:/app/config:ro
+      - agent_data:/app/data
+    depends_on:
+      - napcat
+    networks:
+      - agent-net
+
+volumes:
+  napcat_config:
+  napcat_data:
+  agent_data:
+
+networks:
+  agent-net:
+    driver: bridge

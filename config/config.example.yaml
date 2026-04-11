@@ -1,0 +1,20 @@
+model:
+  name: "glm-4.5-flash"
+  max_turns: 30
+
+napcat:
+  ws_url: "ws://napcat:3001"
+  http_url: "http://napcat:3000"
+
+session:
+  ttl_hours: 24
+  max_history: 50
+
+scheduler:
+  task_timeout_seconds: 300
+  max_tasks_per_user: 10
+
+database:
+  path: "/app/data/claude_agent.db"
+
+data_dir: "/app/data"
