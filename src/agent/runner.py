@@ -244,7 +244,7 @@ class AgentRunner:
             parts.append("")
 
         if workspace_files:
-            parts.append("当前工作区文件:")
+            parts.append("当前工作区文件（用户上传或之前生成的文件，可以直接用 Read/Bash 读取和操作）:")
             parts.extend(workspace_files)
             parts.append("")
 

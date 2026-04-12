@@ -32,8 +32,39 @@ async def download_file(
     file_name = file_name_hint or "unknown"
     target_path = os.path.join(save_dir, file_name)
 
-    download_url = ""
+    # Priority 1: get_file API → check shared volume for local file (fastest)
+    if file_id:
+        try:
+            logger.info("Calling get_file: file_id=%s", file_id[:40])
+            resp = await http_client.post("/get_file", json={"file_id": file_id}, timeout=300)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status") == "ok" and data.get("data"):
+                file_info = data["data"]
 
+                napcat_path = file_info.get("file", "")
+                if napcat_path and napcat_path.startswith("/app/.config/QQ/"):
+                    shared_path = napcat_path.replace("/app/.config/QQ/", "/napcat_files/", 1)
+                    if os.path.exists(shared_path):
+                        import shutil
+                        shutil.copy2(shared_path, target_path)
+                        logger.info("File saved (shared volume): %s (%s bytes)", target_path, os.path.getsize(target_path))
+                        return {"file_name": file_name, "local_path": target_path, "file_size": str(os.path.getsize(target_path))}
+
+                b64_data = file_info.get("base64", "")
+                if b64_data:
+                    import base64
+                    with open(target_path, "wb") as f:
+                        f.write(base64.b64decode(b64_data))
+                    logger.info("File saved (base64): %s (%s bytes)", target_path, os.path.getsize(target_path))
+                    return {"file_name": file_name, "local_path": target_path, "file_size": str(os.path.getsize(target_path))}
+            else:
+                logger.warning("get_file returned: %s", data.get("message", "unknown"))
+        except Exception:
+            logger.exception("get_file failed for %s", file_id)
+
+    # Priority 2: get_group_file_url / get_private_file_url → stream download
+    download_url = ""
     if file_id:
         try:
             if group_id:
@@ -52,7 +83,6 @@ async def download_file(
                 )
             resp.raise_for_status()
             data = resp.json()
-            logger.info("File URL API response: %s", str(data)[:300])
             if data.get("status") == "ok" and data.get("data"):
                 download_url = data["data"].get("url", "")
                 logger.info("Got file URL: %s", download_url[:100] if download_url else "empty")
@@ -60,27 +90,6 @@ async def download_file(
                 logger.warning("get_file_url failed: %s", data.get("message", data))
         except Exception:
             logger.exception("Failed to get file URL for %s", file_id)
-
-    if not download_url and file_id:
-        try:
-            logger.info("Falling back to get_file for %s", file_id[:30])
-            resp = await http_client.post("/get_file", json={"file_id": file_id}, timeout=300)
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("status") == "ok" and data.get("data"):
-                file_info = data["data"]
-                b64_data = file_info.get("base64", "")
-                if b64_data:
-                    import base64
-                    with open(target_path, "wb") as f:
-                        f.write(base64.b64decode(b64_data))
-                    logger.info("File saved (base64): %s (%s bytes)", target_path, os.path.getsize(target_path))
-                    return {"file_name": file_name, "local_path": target_path, "file_size": str(os.path.getsize(target_path))}
-                url_from_api = file_info.get("url", "")
-                if url_from_api and url_from_api.startswith("http"):
-                    download_url = url_from_api
-        except Exception:
-            logger.exception("get_file fallback failed for %s", file_id)
 
     if download_url:
         try:

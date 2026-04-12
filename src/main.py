@@ -142,6 +142,7 @@ class Application:
                 "/help - 显示帮助\n"
                 "/clear - 清空当前会话历史\n"
                 "/new - 新会话（清历史 + 清工作区文件）\n"
+                "/files - 查看当前工作区文件\n"
                 "/tasks - 查看我的定时任务\n"
                 "/model - 查看当前模型配置"
             )
@@ -171,6 +172,30 @@ class Application:
                 result += "\n工作区文件已清空 ✓"
 
             await self.qq_bot.send_text(msg.session_key, result)
+            return True
+
+        if cmd == "/files":
+            workspace_id = f"group_{msg.group_id}" if msg.is_group else msg.user_id
+            workspace_dir = f"/app/data/workspace/{workspace_id}"
+            if os.path.isdir(workspace_dir):
+                files = []
+                for name in sorted(os.listdir(workspace_dir)):
+                    path = os.path.join(workspace_dir, name)
+                    if os.path.isfile(path):
+                        size = os.path.getsize(path)
+                        if size > 1024 * 1024:
+                            s = f"{size / 1024 / 1024:.1f}MB"
+                        elif size > 1024:
+                            s = f"{size / 1024:.1f}KB"
+                        else:
+                            s = f"{size}B"
+                        files.append(f"  {name} ({s})")
+                if files:
+                    await self.qq_bot.send_text(msg.session_key, f"📁 工作区文件 ({workspace_id}):\n" + "\n".join(files))
+                else:
+                    await self.qq_bot.send_text(msg.session_key, "工作区为空")
+            else:
+                await self.qq_bot.send_text(msg.session_key, "工作区为空")
             return True
 
         if cmd == "/tasks":
