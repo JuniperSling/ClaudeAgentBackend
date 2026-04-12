@@ -82,6 +82,13 @@ class QQBot(BaseChannel):
         user_id = str(event.get("user_id", ""))
         raw_message = event.get("raw_message", "").strip()
         group_id = str(event.get("group_id", "")) if event.get("group_id") else None
+        msg_segments = event.get("message", [])
+
+        logger.debug(
+            "Event: type=%s, user=%s, group=%s, segments=%s",
+            msg_type, user_id, group_id,
+            json.dumps([{"type": s.get("type"), "keys": list(s.get("data", {}).keys())} for s in msg_segments], ensure_ascii=False),
+        )
 
         if not raw_message or not user_id:
             return
@@ -97,11 +104,17 @@ class QQBot(BaseChannel):
 
         file_segments = []
         text_parts = []
-        for seg in event.get("message", []):
+        for seg in msg_segments:
             seg_type = seg.get("type", "")
             seg_data = seg.get("data", {})
-            if seg_type in ("file", "image") and (seg_data.get("file_id") or seg_data.get("url")):
+            if seg_type == "file" and (seg_data.get("file_id") or seg_data.get("url")):
                 file_segments.append(seg_data)
+            elif seg_type == "image":
+                summary = seg_data.get("summary", "")
+                if summary and summary.startswith("[") and "表情" in summary:
+                    continue
+                if seg_data.get("file_id") or seg_data.get("url"):
+                    file_segments.append(seg_data)
             elif seg_type == "text" and seg_data.get("text", "").strip():
                 text_parts.append(seg_data["text"].strip())
 

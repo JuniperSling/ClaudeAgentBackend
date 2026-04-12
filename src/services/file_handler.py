@@ -91,6 +91,10 @@ async def download_file(
         except Exception:
             logger.exception("Failed to get file URL for %s", file_id)
 
+    if not download_url and direct_url and direct_url.startswith("http"):
+        download_url = direct_url
+        logger.info("Using direct URL from message segment")
+
     if download_url:
         try:
             logger.info("Downloading file: %s -> %s", download_url[:80], target_path)
