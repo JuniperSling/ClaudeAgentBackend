@@ -86,9 +86,6 @@ class QQBot(BaseChannel):
         if not raw_message or not user_id:
             return
 
-        if "[CQ:file" in raw_message or "[CQ:image" in raw_message:
-            logger.info("File event raw message segments: %s", json.dumps(event.get("message", []), ensure_ascii=False)[:1000])
-
         import re
         raw_message = re.sub(r"\[CQ:reply,id=[^\]]*\]\s*", "", raw_message).strip()
 
@@ -96,66 +93,88 @@ class QQBot(BaseChannel):
         session_key = f"qq:group:{group_id}" if is_group else f"qq:c2c:{user_id}"
         message_id = str(event.get("message_id", ""))
 
-        from src.services.file_handler import parse_cq_files, download_file, extract_text
-        cq_files = parse_cq_files(raw_message)
-        has_files = bool(cq_files)
+        from src.services.file_handler import download_file, extract_text
 
-        is_slash_cmd = raw_message.lstrip().startswith("/")
+        file_segments = []
+        text_parts = []
+        for seg in event.get("message", []):
+            seg_type = seg.get("type", "")
+            seg_data = seg.get("data", {})
+            if seg_type in ("file", "image") and (seg_data.get("file_id") or seg_data.get("url")):
+                file_segments.append(seg_data)
+            elif seg_type == "text" and seg_data.get("text", "").strip():
+                text_parts.append(seg_data["text"].strip())
+
+        user_text = " ".join(text_parts)
+        user_text = re.sub(r"\[CQ:[^\]]*\]", "", user_text).strip()
+        if is_group:
+            self_id = str(event.get("self_id", ""))
+            user_text = re.sub(rf"\[CQ:at,qq={self_id}\]\s*", "", user_text).strip()
+
+        has_files = bool(file_segments)
+
+        is_slash_cmd = user_text.startswith("/")
 
         if is_group and not has_files and not is_slash_cmd:
             self_id = str(event.get("self_id", ""))
             if not re.search(rf"\[CQ:at,qq={self_id}\]", raw_message):
                 return
-            raw_message = re.sub(r"\[CQ:at,qq=\d+\]\s*", "", raw_message).strip()
-            if not raw_message:
+            user_text = re.sub(r"\[CQ:at,qq=\d+\]\s*", "", user_text).strip()
+            if not user_text:
                 return
+
         file_context = ""
         workspace_id = f"group_{group_id}" if is_group else user_id
         workspace_dir = f"/app/data/workspace/{workspace_id}"
 
-        if cq_files:
+        if file_segments:
+            logger.info("Processing %d file(s): is_group=%s, group_id=%s, user=%s", len(file_segments), is_group, group_id, user_id)
             downloaded_names = []
-            for cqf in cq_files:
-                raw_message = raw_message.replace(cqf["raw"], "").strip()
-                file_id = cqf["params"].get("file_id", "")
-                file_name = cqf["params"].get("file", cqf["params"].get("file_name", "unknown"))
-                if not file_id:
-                    continue
+            failed_names = []
+            for seg_data in file_segments:
+                file_id = seg_data.get("file_id", "")
+                file_name = seg_data.get("file", seg_data.get("file_name", "unknown"))
+                direct_url = seg_data.get("url", "")
 
-                file_info = await download_file(self._http, file_id, workspace_dir)
+                file_info = await download_file(self._http, file_id, workspace_dir, direct_url=direct_url, file_name_hint=file_name, group_id=group_id)
                 if file_info:
-                    local_path = file_info.get("local_path", "")
                     downloaded_names.append(file_name)
-                    if raw_message:
+                    if user_text:
+                        local_path = file_info.get("local_path", "")
                         extracted = extract_text(local_path) if local_path else None
                         if extracted:
                             file_context += f"\n\n[文件: {file_name}]\n{extracted}"
                         else:
                             file_context += f"\n\n[文件: {file_name}] (已保存到工作区)"
                 else:
-                    file_context += f"\n\n[文件: {file_name}] (下载失败)"
+                    failed_names.append(file_name)
 
-            if not raw_message and downloaded_names:
-                names_str = ", ".join(downloaded_names)
+            if not user_text:
+                api = "/send_private_msg" if not is_group else "/send_group_msg"
+                key = "user_id" if not is_group else "group_id"
+                target = int(group_id if is_group else user_id)
+                if failed_names and not downloaded_names:
+                    text = f"文件下载失败: {', '.join(failed_names)}"
+                elif failed_names:
+                    text = f"📎 已收到: {', '.join(downloaded_names)}\n下载失败: {', '.join(failed_names)}"
+                else:
+                    text = f"📎 已收到文件: {', '.join(downloaded_names)}"
                 try:
-                    await self._http.post(
-                        "/send_private_msg" if not is_group else "/send_group_msg",
-                        json={
-                            ("user_id" if not is_group else "group_id"): int(group_id if is_group else user_id),
-                            "message": [
-                                {"type": "reply", "data": {"id": str(event.get("message_id", ""))}},
-                                {"type": "text", "data": {"text": f"📎 已收到文件: {names_str}\n文件已保存到工作区，你可以告诉我需要做什么处理。"}},
-                            ],
-                        },
-                    )
+                    await self._http.post(api, json={
+                        key: target,
+                        "message": [
+                            {"type": "reply", "data": {"id": message_id}},
+                            {"type": "text", "data": {"text": text}},
+                        ],
+                    })
                 except Exception:
                     logger.exception("Failed to send file receipt")
                 return
 
-        if not raw_message and not file_context:
+        if not user_text and not file_context:
             return
 
-        content = raw_message
+        content = user_text
         if file_context:
             content = (content + file_context).strip()
 
@@ -207,7 +226,7 @@ class QQBot(BaseChannel):
         """Direct group message send for scheduled tasks etc."""
         chunks = self._split_message(text)
         for chunk in chunks:
-            message = [{"type": "text", "data": {"text": chunk}}]
+            message = self._parse_at_tags(chunk)
             await self._http.post(
                 "/send_group_msg",
                 json={"group_id": int(group_id), "message": message},
@@ -261,6 +280,19 @@ class QQBot(BaseChannel):
             logger.info("File sent: %s -> %s", file_name, session_key)
         except Exception:
             logger.exception("Failed to send file %s to %s", file_name, session_key)
+
+    def _parse_at_tags(self, text: str) -> list[dict]:
+        """Parse [at:QQ号] tags into message segments."""
+        import re
+        segments = []
+        parts = re.split(r"(\[at:\d+\])", text)
+        for part in parts:
+            m = re.match(r"\[at:(\d+)\]", part)
+            if m:
+                segments.append({"type": "at", "data": {"qq": m.group(1)}})
+            elif part:
+                segments.append({"type": "text", "data": {"text": part}})
+        return segments if segments else [{"type": "text", "data": {"text": text}}]
 
     def _split_message(self, text: str) -> list[str]:
         if len(text) <= MAX_QQ_MSG_LENGTH:
