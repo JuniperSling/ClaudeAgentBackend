@@ -79,12 +79,12 @@ class Application:
     async def _process_message(self, msg: IncomingMessage):
         user = await self.user_mgr.get_by_qq_id(msg.user_id)
         if not user:
-            logger.info("Unauthorized QQ user: %s", msg.user_id)
-            if not msg.is_group:
-                await self.qq_bot.send_text(
-                    msg.session_key, "抱歉，您不在授权用户名单中。"
-                )
-            return
+            import uuid
+            auto_pw = uuid.uuid4().hex[:12]
+            user = await self.user_mgr.create_user(
+                qq_id=msg.user_id, password=auto_pw, nickname=f"QQ_{msg.user_id[-4:]}"
+            )
+            logger.info("Auto-registered QQ user: %s", msg.user_id)
 
         if msg.content.startswith("/"):
             handled = await self._handle_command(msg, user)
