@@ -4,7 +4,7 @@ import os
 import signal
 import sys
 
-from src.config import init_config, get_config, get_env
+from src.config import init_config, get_config, get_env, get_active_model, set_active_model, MODEL_PRESETS
 from src.services.database import init_db, close_db
 from src.users.manager import UserManager
 from src.session.manager import SessionManager
@@ -144,7 +144,7 @@ class Application:
                 "/new - 新会话（清历史 + 清工作区文件）\n"
                 "/files - 查看当前工作区文件\n"
                 "/tasks - 查看我的定时任务\n"
-                "/model - 查看当前模型配置"
+                "/model - 查看/切换模型 (如 /model deepseek-v4-flash)"
             )
             if user["role"] == "admin":
                 help_text += (
@@ -210,11 +210,30 @@ class Application:
             return True
 
         if cmd == "/model":
-            config = get_config()
-            await self.qq_bot.send_text(
-                msg.session_key,
-                f"当前模型: {config.model.name}\nMax turns: {config.model.max_turns}",
-            )
+            if not args.strip():
+                active = get_active_model()
+                lines = [f"当前模型: {active}", "", "可用模型:"]
+                for key, preset in MODEL_PRESETS.items():
+                    marker = " ← 当前" if key == active else ""
+                    lines.append(f"  {key} - {preset.display_name}{marker}")
+                lines.append("")
+                lines.append("切换: /model <模型名>")
+                await self.qq_bot.send_text(msg.session_key, "\n".join(lines))
+            else:
+                model_name = args.strip()
+                if model_name not in MODEL_PRESETS:
+                    await self.qq_bot.send_text(
+                        msg.session_key,
+                        f"未知模型: {model_name}\n可用: {', '.join(MODEL_PRESETS.keys())}",
+                    )
+                else:
+                    set_active_model(model_name)
+                    preset = MODEL_PRESETS[model_name]
+                    await self.qq_bot.send_text(
+                        msg.session_key,
+                        f"模型已切换: {preset.display_name}",
+                    )
+                    logger.info("Model switched to: %s", model_name)
             return True
 
         if cmd == "/adduser" and user["role"] == "admin":

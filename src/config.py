@@ -6,8 +6,43 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 
 
+class ModelPreset(BaseModel):
+    name: str
+    display_name: str = ""
+    base_url: str = ""
+    api_key_env: str = ""
+
+
+MODEL_PRESETS: dict[str, ModelPreset] = {
+    "glm-4.7": ModelPreset(
+        name="glm-4.7",
+        display_name="GLM-4.7 (智谱旗舰)",
+        base_url="https://open.bigmodel.cn/api/anthropic",
+        api_key_env="ZHIPU_API_KEY",
+    ),
+    "glm-5.1": ModelPreset(
+        name="glm-5.1",
+        display_name="GLM-5.1 (智谱)",
+        base_url="https://open.bigmodel.cn/api/anthropic",
+        api_key_env="ZHIPU_API_KEY",
+    ),
+    "deepseek-v4-flash": ModelPreset(
+        name="deepseek-v4-flash",
+        display_name="DeepSeek V4 Flash (快速)",
+        base_url="https://api.deepseek.com/anthropic",
+        api_key_env="DEEPSEEK_API_KEY",
+    ),
+    "deepseek-v4-pro": ModelPreset(
+        name="deepseek-v4-pro",
+        display_name="DeepSeek V4 Pro (强力)",
+        base_url="https://api.deepseek.com/anthropic",
+        api_key_env="DEEPSEEK_API_KEY",
+    ),
+}
+
+
 class ModelConfig(BaseModel):
-    name: str = "glm-4.5-flash"
+    name: str = "glm-5.1"
     max_turns: int = 30
 
 
@@ -27,8 +62,9 @@ class SchedulerConfig(BaseModel):
 
 
 class EnvSettings(BaseSettings):
-    anthropic_base_url: str = "https://open.bigmodel.cn/api/anthropic"
-    anthropic_api_key: str = ""
+    zhipu_api_key: str = ""
+    deepseek_api_key: str = ""
+    serper_api_key: str = ""
     admin_qq_id: str = ""
     admin_password: str = "changeme"
 
@@ -65,6 +101,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
 
 _env: EnvSettings | None = None
 _config: AppConfig | None = None
+_active_model: str | None = None
 
 
 def get_env() -> EnvSettings:
@@ -81,10 +118,35 @@ def get_config() -> AppConfig:
     return _config
 
 
+def get_active_model() -> str:
+    global _active_model
+    if _active_model is None:
+        _active_model = get_config().model.name
+    return _active_model
+
+
+def set_active_model(model_name: str):
+    global _active_model
+    _active_model = model_name
+
+
+def get_model_env(model_name: str) -> tuple[str, str]:
+    """Returns (base_url, api_key) for a given model name."""
+    preset = MODEL_PRESETS.get(model_name)
+    if not preset:
+        preset = MODEL_PRESETS.get(get_config().model.name)
+    env = get_env()
+    base_url = preset.base_url
+    api_key = getattr(env, preset.api_key_env.lower(), "") if preset.api_key_env else ""
+    return base_url, api_key
+
+
 def init_config(config_path: str | None = None):
-    global _config, _env
+    global _config, _env, _active_model
     _env = EnvSettings()
     _config = load_config(config_path)
+    _active_model = _config.model.name
 
-    os.environ.setdefault("ANTHROPIC_BASE_URL", _env.anthropic_base_url)
-    os.environ.setdefault("ANTHROPIC_API_KEY", _env.anthropic_api_key)
+    base_url, api_key = get_model_env(_active_model)
+    os.environ["ANTHROPIC_BASE_URL"] = base_url
+    os.environ["ANTHROPIC_API_KEY"] = api_key

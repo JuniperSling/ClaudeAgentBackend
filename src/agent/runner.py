@@ -12,7 +12,7 @@ from claude_agent_sdk import (
     create_sdk_mcp_server,
 )
 
-from src.config import get_config, get_env
+from src.config import get_config, get_env, get_active_model, get_model_env
 from src.agent.tools import ALL_TOOLS, MCP_SERVER_NAME, TOOL_NAMES, set_context
 
 logger = logging.getLogger(__name__)
@@ -60,9 +60,6 @@ def _strip_markdown(text: str) -> str:
 class AgentRunner:
     def __init__(self):
         self.config = get_config()
-        env = get_env()
-        os.environ["ANTHROPIC_BASE_URL"] = env.anthropic_base_url
-        os.environ["ANTHROPIC_API_KEY"] = env.anthropic_api_key
 
         self._mcp_server = create_sdk_mcp_server(
             name=MCP_SERVER_NAME,
@@ -87,12 +84,17 @@ class AgentRunner:
         user_workspace = f"/app/data/workspace/{wid}"
         os.makedirs(user_workspace, exist_ok=True)
 
+        active_model = get_active_model()
+        base_url, api_key = get_model_env(active_model)
+        os.environ["ANTHROPIC_BASE_URL"] = base_url
+        os.environ["ANTHROPIC_API_KEY"] = api_key
+
         workspace_files = self._list_workspace_files(user_workspace)
         prompt = self._build_prompt(user_message, history, system_prompt, workspace_files)
-        logger.debug("Agent prompt: %s", prompt[:200])
+        logger.info("Using model: %s (base_url: %s)", active_model, base_url[:40])
 
         options = ClaudeAgentOptions(
-            model=self.config.model.name,
+            model=active_model,
             max_turns=self.config.model.max_turns,
             permission_mode="bypassPermissions",
             cwd=user_workspace,
