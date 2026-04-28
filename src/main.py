@@ -53,6 +53,7 @@ class Application:
 
         self.scheduler = TaskScheduler()
         self.scheduler.set_send_func(self._scheduler_send)
+        self.scheduler.set_llm_runner(self._scheduler_run_llm)
 
         await self.qq_bot.start(on_message=self.handle_message)
         await self.scheduler.start()
@@ -97,12 +98,14 @@ class Application:
             channel_session_id=msg.session_key,
         )
 
-        history = await self.session_mgr.get_history(session["id"])
+        agent_session_id = await self.session_mgr.get_agent_session_id(session["id"])
         await self.session_mgr.append_message(session["id"], "user", msg.content)
 
         logger.info(
-            "Processing: user=%s(%s), session=%s, msg=%s",
-            user["nickname"], msg.user_id, session["id"], msg.content[:50],
+            "Processing: user=%s(%s), session=%s, agent_sid=%s, msg=%s",
+            user["nickname"], msg.user_id, session["id"],
+            (agent_session_id or "")[:8] if agent_session_id else "new",
+            msg.content[:50],
         )
 
         await self.qq_bot.send_text(msg.session_key, "正在思考中...", reply_to=msg.message_id)
@@ -118,15 +121,18 @@ class Application:
             last_progress_time = now
             await self.qq_bot.send_text(msg.session_key, text, reply_to=msg.message_id)
 
-        reply = await self.agent.run(
+        reply, new_agent_sid = await self.agent.run(
             user_message=msg.content,
-            history=history,
             on_progress=on_progress,
             scheduler=self.scheduler,
             user=user,
             session_key=msg.session_key,
             workspace_id=msg.workspace_id,
+            resume_session_id=agent_session_id,
         )
+
+        if new_agent_sid and new_agent_sid != agent_session_id:
+            await self.session_mgr.set_agent_session_id(session["id"], new_agent_sid)
 
         await self.session_mgr.append_message(session["id"], "assistant", reply)
         await self.qq_bot.send_text(msg.session_key, reply, reply_to=msg.message_id)
@@ -276,6 +282,40 @@ class Application:
                 await self.qq_bot.send_group_text(target_id[6:], text)
             else:
                 await self.qq_bot.send_private_text(target_id, text)
+
+    async def _scheduler_run_llm(self, task: dict):
+        """Trigger an LLM task: run Agent with the cron's prompt and send result."""
+        owner_id = task.get("owner_id", "")
+        target_channel = task.get("target_channel", "qq")
+        target_id = task.get("target_id", "")
+        params = task.get("params", {})
+        prompt = params.get("prompt", "")
+        session_key = params.get("session_key", "")
+        workspace_id = params.get("workspace_id", "")
+
+        if not prompt:
+            logger.warning("LLM task %s has empty prompt", task.get("task_id"))
+            return
+
+        user = None
+        if owner_id:
+            user_row = await self.user_mgr.get_by_id(owner_id)
+            if user_row:
+                user = user_row
+
+        logger.info("Running LLM task: target=%s, prompt=%s", target_id, prompt[:60])
+
+        try:
+            reply, _ = await self.agent.run(
+                user_message=prompt,
+                user=user,
+                session_key=session_key,
+                workspace_id=workspace_id,
+            )
+            if reply:
+                await self._scheduler_send(target_channel, target_id, reply)
+        except Exception:
+            logger.exception("LLM task %s failed", task.get("task_id"))
 
 
 async def main():

@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     channel TEXT NOT NULL DEFAULT 'qq',
     channel_session_id TEXT NOT NULL,
     history TEXT NOT NULL DEFAULT '[]',
+    agent_session_id TEXT,
     last_active TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
@@ -59,6 +60,14 @@ async def init_db(db_path: str | None = None):
     _db = await aiosqlite.connect(_db_path)
     _db.row_factory = aiosqlite.Row
     await _db.executescript(SCHEMA_SQL)
+
+    # Migration: add agent_session_id column if missing
+    cursor = await _db.execute("PRAGMA table_info(sessions)")
+    cols = [row[1] for row in await cursor.fetchall()]
+    if "agent_session_id" not in cols:
+        await _db.execute("ALTER TABLE sessions ADD COLUMN agent_session_id TEXT")
+        logger.info("Migration: added agent_session_id column to sessions")
+
     await _db.commit()
     logger.info("Database initialized: %s", _db_path)
 

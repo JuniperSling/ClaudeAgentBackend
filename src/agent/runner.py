@@ -6,38 +6,52 @@ import re
 import time
 from typing import Callable, Awaitable
 
+import urllib.request
+
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    HookMatcher,
     create_sdk_mcp_server,
 )
 
 from src.config import get_config, get_env, get_active_model, get_model_env
 from src.agent.tools import ALL_TOOLS, MCP_SERVER_NAME, TOOL_NAMES, set_context
 
+INTERNAL_API = "http://127.0.0.1:9199"
+
+
+def _api_post(path: str, body: dict) -> dict:
+    """Sync HTTP POST to internal API (for use in hooks)."""
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"{INTERNAL_API}{path}",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode())
+        except Exception:
+            return {"error": str(e)}
+    except Exception as e:
+        return {"error": str(e)}
+
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """你是一个部署在QQ上的AI助手，用中文回复，保持简洁。
+SYSTEM_PROMPT = """你是一个部署在QQ上的AI助手，用中文回复，保持简洁友好。
 
-重要格式规则：
-- 不要使用Markdown格式（不要用 **加粗**、# 标题、- 列表、```代码块``` 等）
-- 用纯文本排版，用换行和空行来分隔段落
-- 用数字编号（1. 2. 3.）代替列表符号
-- 用「」或引号代替加粗强调
+输出格式：
+- 不要使用 Markdown 语法（如 **加粗**、# 标题、- 列表、```代码块``` 等）
+- 用纯文本排版，换行和空行分隔段落
+- 用数字编号（1. 2. 3.）代替列表符号，用「」或引号代替加粗强调
 
-关键规则：
-1. 你可以使用web_search搜索网页。当用户问天气、新闻、价格、实时信息或你不确定的事情时，必须使用web_search搜索，不要说你做不到。
-2. 你有定时任务管理工具。当用户要求创建/查看/删除定时任务时，必须调用对应工具，不要只用文字描述。
-3. 所有文件操作（创建、读取、写入）必须在当前工作目录下进行，不要使用/tmp或其他路径。用相对路径即可。
-4. 需要发送文件给用户时，用send_file_to_chat工具，file_path用当前工作目录下的绝对路径。
-
-工具说明：
-- create_scheduled_task：cron_expr是5字段格式（分 时 日 月 周几），最小间隔1分钟。script_content是Python脚本，其stdout会作为消息发送。消息自动发送到当前对话（群聊发群里，私聊发私聊）。
-- list_my_tasks：无需参数。
-- delete_scheduled_task：需要task_id。
-- send_file_to_chat：发送文件给用户。file_path是服务器上的绝对路径，file_name是显示名。留空target_session则发到当前对话。
-- web_search：搜索网页，返回标题、链接和摘要。
-- web_fetch：抓取网页内容。
+行为准则：
+- 文件读写在当前工作目录（cwd）下进行，使用相对路径
 """
 
 ProgressCallback = Callable[[str, str], Awaitable[None]]
@@ -70,14 +84,15 @@ class AgentRunner:
     async def run(
         self,
         user_message: str,
-        history: list[dict] | None = None,
         system_prompt: str | None = None,
         on_progress: ProgressCallback | None = None,
         scheduler=None,
         user: dict | None = None,
         session_key: str | None = None,
         workspace_id: str | None = None,
-    ) -> str:
+        resume_session_id: str | None = None,
+    ) -> tuple[str, str | None]:
+        """Run agent. Returns (reply_text, agent_session_id)."""
         set_context(user, session_key)
 
         wid = workspace_id or (user["id"] if user else "default")
@@ -89,19 +104,110 @@ class AgentRunner:
         os.environ["ANTHROPIC_BASE_URL"] = base_url
         os.environ["ANTHROPIC_API_KEY"] = api_key
 
-        workspace_files = self._list_workspace_files(user_workspace)
-        prompt = self._build_prompt(user_message, history, system_prompt, workspace_files)
-        logger.info("Using model: %s (base_url: %s)", active_model, base_url[:40])
+        sys_prompt = system_prompt or SYSTEM_PROMPT
+        logger.info("Using model: %s, resume=%s", active_model, resume_session_id[:8] if resume_session_id else None)
 
-        options = ClaudeAgentOptions(
+        owner_id = user["id"] if user else ""
+        qq_id = user["qq_id"] if user else ""
+        sk = session_key or ""
+
+        async def cron_create_hook(input_data, tool_use_id, context):
+            args = input_data.get("tool_input", {})
+            cron = args.get("cron", "")
+            recurring = args.get("recurring", True)
+            prompt_text = args.get("prompt", "")
+
+            result = _api_post("/cron/create", {
+                "owner_id": owner_id,
+                "qq_id": qq_id,
+                "session_key": sk,
+                "cron": cron,
+                "recurring": recurring,
+                "prompt": prompt_text,
+            })
+            if "error" in result:
+                reason = f"任务创建失败: {result['error']}"
+            else:
+                tid = result.get("task_id", "")
+                target = "当前群聊" if sk.startswith("qq:group:") else "私聊"
+                schedule = "一次性" if not recurring else "周期性"
+                reason = f"已创建{schedule}定时任务 {tid}\nCron: {cron}\n触发指令: {prompt_text[:60]}\n发送目标: {target}"
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }
+
+        async def cron_list_hook(input_data, tool_use_id, context):
+            result = _api_post("/cron/list", {"owner_id": owner_id})
+            if "error" in result:
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": f"列任务失败: {result['error']}",
+                    }
+                }
+            tasks = result.get("tasks", [])
+            if not tasks:
+                reason = "当前没有定时任务"
+            else:
+                lines = []
+                for t in tasks:
+                    schedule = "一次性" if not t.get("recurring", True) else "周期"
+                    lines.append(f"[{t['id']}] {schedule} | {t['cron']} | {t['prompt'][:50]}")
+                reason = "当前定时任务:\n" + "\n".join(lines)
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }
+
+        async def cron_delete_hook(input_data, tool_use_id, context):
+            args = input_data.get("tool_input", {})
+            task_id = args.get("id") or args.get("task_id") or ""
+            result = _api_post("/cron/delete", {
+                "owner_id": owner_id,
+                "task_id": task_id,
+            })
+            if "error" in result:
+                reason = f"删除失败: {result['error']}"
+            else:
+                reason = f"已删除任务 {task_id}"
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }
+
+        options_kwargs = dict(
             model=active_model,
             max_turns=self.config.model.max_turns,
             permission_mode="bypassPermissions",
             cwd=user_workspace,
             mcp_servers={MCP_SERVER_NAME: self._mcp_server},
+            system_prompt={"type": "preset", "preset": "claude_code", "append": sys_prompt},
+            hooks={
+                "PreToolUse": [
+                    HookMatcher(matcher="CronCreate", hooks=[cron_create_hook]),
+                    HookMatcher(matcher="CronList", hooks=[cron_list_hook]),
+                    HookMatcher(matcher="CronDelete", hooks=[cron_delete_hook]),
+                ],
+            },
         )
+        if resume_session_id:
+            options_kwargs["resume"] = resume_session_id
+
+        options = ClaudeAgentOptions(**options_kwargs)
 
         result_text = ""
+        new_session_id = None
         turn_count = 0
         last_tool_use = None
         last_event_time = time.monotonic()
@@ -122,7 +228,7 @@ class AgentRunner:
 
         try:
             async with ClaudeSDKClient(options=options) as client:
-                await client.query(prompt)
+                await client.query(user_message)
                 heartbeat_task = asyncio.create_task(_heartbeat())
 
                 async for message in client.receive_response():
@@ -151,6 +257,10 @@ class AgentRunner:
                                 tool_input = getattr(block, "input", {})
                                 last_thinking = ""
                                 logger.info("Tool call: %s | %s", tool_name, json.dumps(tool_input, ensure_ascii=False)[:500])
+
+                                if not on_progress:
+                                    last_tool_use = tool_name
+                                    continue
 
                                 mcp_labels = {
                                     f"mcp__{MCP_SERVER_NAME}__web_search": "🔍 搜索网页",
@@ -192,13 +302,22 @@ class AgentRunner:
                         if turn_count > 1:
                             await on_progress("progress", f"⏳ 处理中 (第{turn_count}轮)")
 
+                    elif msg_type == "SystemMessage":
+                        sid = getattr(message, "data", {}).get("session_id") if hasattr(message, "data") else None
+                        if sid:
+                            new_session_id = sid
+
                     elif msg_type == "ResultMessage":
                         if not result_text and hasattr(message, "result"):
                             result_text = message.result or ""
+                        sid = getattr(message, "session_id", None)
+                        if sid:
+                            new_session_id = sid
                         logger.info(
-                            "Agent completed: turns=%s, cost=$%.4f",
+                            "Agent completed: turns=%s, cost=$%.4f, session=%s",
                             getattr(message, "num_turns", "?"),
                             getattr(message, "total_cost_usd", 0),
+                            (new_session_id or "")[:12],
                         )
 
         except Exception as e:
@@ -209,53 +328,6 @@ class AgentRunner:
                 heartbeat_task.cancel()
             set_context(None, None)
 
-        return _strip_markdown(result_text) if result_text else "（无回复）"
+        reply = _strip_markdown(result_text) if result_text else "（无回复）"
+        return reply, new_session_id
 
-    def _list_workspace_files(self, workspace: str) -> list[str]:
-        if not os.path.isdir(workspace):
-            return []
-        files = []
-        for name in sorted(os.listdir(workspace)):
-            path = os.path.join(workspace, name)
-            if os.path.isfile(path):
-                size = os.path.getsize(path)
-                if size > 1024 * 1024:
-                    size_str = f"{size / 1024 / 1024:.1f}MB"
-                elif size > 1024:
-                    size_str = f"{size / 1024:.1f}KB"
-                else:
-                    size_str = f"{size}B"
-                files.append(f"  {name} ({size_str})")
-        return files
-
-    def _build_prompt(
-        self,
-        user_message: str,
-        history: list[dict] | None,
-        system_prompt: str | None,
-        workspace_files: list[str] | None = None,
-        extra_context: str | None = None,
-    ) -> str:
-        parts = []
-        sys_prompt = system_prompt or SYSTEM_PROMPT
-        parts.append(sys_prompt.strip())
-        parts.append("")
-
-        if extra_context:
-            parts.append(extra_context)
-            parts.append("")
-
-        if workspace_files:
-            parts.append("当前工作区文件（用户上传或之前生成的文件，可以直接用 Read/Bash 读取和操作）:")
-            parts.extend(workspace_files)
-            parts.append("")
-
-        if history:
-            parts.append("Recent conversation:")
-            for msg in history[-10:]:
-                role = "User" if msg.get("role") == "user" else "Assistant"
-                parts.append(f"{role}: {msg.get('content', '')}")
-            parts.append("")
-
-        parts.append(f"User: {user_message}")
-        return "\n".join(parts)

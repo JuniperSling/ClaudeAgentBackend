@@ -171,16 +171,16 @@ docker compose restart claude-agent
 
 ## 模型配置
 
-通过 `ANTHROPIC_BASE_URL` 环境变量切换模型提供商。当前使用智谱 AI 的 Anthropic 兼容端点：
+通过 `MODEL_PRESETS` 注册多个模型，可在运行时通过 `/model <name>` 切换：
 
-```yaml
-# config/config.yaml
-model:
-  name: "glm-5.1"      # 智谱模型名称
-  max_turns: 30         # Agent 最大轮次
-```
+| 模型 | 提供商 | 用途 |
+|------|--------|------|
+| glm-4.7 | 智谱 GLM-4.7 | 高智能旗舰 |
+| glm-5.1 | 智谱 GLM-5.1 | 默认 |
+| deepseek-v4-flash | DeepSeek V4 Flash | 快速/低成本 |
+| deepseek-v4-pro | DeepSeek V4 Pro | 强力 |
 
-支持的模型：glm-4.5-flash（免费）、glm-4.5-air、glm-4.7、glm-5.1 等。
+每个模型映射到独立的 `base_url` 和 API Key 环境变量。运行时通过 `/model deepseek-v4-flash` 等命令切换。
 
 ## Agent 权限模式
 
@@ -194,9 +194,18 @@ Agent 通过 in-process MCP Server 注册自定义工具，工具在 Claude Code
 |--------|------|
 | web_search | Google 搜索（Serper API） |
 | web_fetch | 抓取网页内容 |
-| create_scheduled_task | 创建 cron 定时任务 |
-| list_my_tasks | 查看当前用户的任务 |
-| delete_scheduled_task | 删除任务 |
+| send_file_to_chat | 发送文件到当前 QQ 对话 |
+| get_current_user_info | 获取当前用户信息 |
+
+## SDK 内置工具拦截（Cron）
+
+通过 PreToolUse hook 拦截 Claude Code CLI 内置的 `CronCreate`/`CronList`/`CronDelete` 工具，
+将它们转发到我们的 `TaskScheduler`：
+
+- **CronCreate**：用户说"X 时间提醒我 Y"时 Agent 会调用此工具，hook 把任务存到我们的数据库
+- **任务触发**：APScheduler 到点时启动新的 ClaudeSDKClient，把 cron 的 `prompt` 作为 user_message
+- **一次性任务**：`recurring=false` 时执行后自动删除
+- **session 路由**：任务的目标会话从创建时的 `session_key` 推导（私聊回私聊，群聊回群聊）
 | get_current_user_info | 获取当前用户信息 |
 | send_file_to_chat | 发送文件到 QQ 对话 |
 

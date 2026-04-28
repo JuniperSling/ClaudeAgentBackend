@@ -44,6 +44,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._handle_task_list(body)
         elif self.path == "/task/delete":
             self._handle_task_delete(body)
+        elif self.path == "/cron/create":
+            self._handle_cron_create(body)
+        elif self.path == "/cron/list":
+            self._handle_cron_list(body)
+        elif self.path == "/cron/delete":
+            self._handle_cron_delete(body)
         elif self.path == "/user/info":
             self._handle_user_info(body)
         elif self.path == "/file/send":
@@ -95,6 +101,103 @@ class _Handler(BaseHTTPRequestHandler):
             loop.close()
 
     def _handle_task_delete(self, body: dict):
+        app = _app_ref
+        if not app or not app.scheduler:
+            self._reply(500, {"error": "scheduler not available"})
+            return
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(
+                app.scheduler.remove_task(body["task_id"], owner_id=body.get("owner_id"))
+            )
+            self._reply(200, {"ok": True})
+        except Exception as e:
+            self._reply(400, {"error": str(e)})
+        finally:
+            loop.close()
+
+    def _handle_cron_create(self, body: dict):
+        """Create LLM-prompt task. body: {owner_id, qq_id, session_key, cron, recurring, prompt, name}"""
+        app = _app_ref
+        if not app or not app.scheduler:
+            self._reply(500, {"error": "scheduler not available"})
+            return
+
+        cron = body["cron"].strip()
+        recurring = body.get("recurring", True)
+        prompt = body["prompt"]
+        owner_id = body["owner_id"]
+        session_key = body["session_key"]
+        qq_id = body.get("qq_id", "")
+
+        # Determine target_id from session_key
+        parts = session_key.split(":", 2)
+        if len(parts) == 3 and parts[1] == "group":
+            target_id = f"group:{parts[2]}"
+        else:
+            target_id = qq_id or parts[2] if len(parts) == 3 else qq_id
+
+        # workspace_id for LLM execution
+        if len(parts) == 3 and parts[1] == "group":
+            workspace_id = f"group_{parts[2]}"
+        else:
+            workspace_id = qq_id
+
+        loop = asyncio.new_event_loop()
+        try:
+            task_id = loop.run_until_complete(app.scheduler.add_task(
+                owner_id=owner_id,
+                name=body.get("name") or prompt[:30],
+                cron_expr=cron,
+                target_channel="qq",
+                target_id=target_id,
+                task_type="llm",
+                params={
+                    "prompt": prompt,
+                    "recurring": recurring,
+                    "session_key": session_key,
+                    "workspace_id": workspace_id,
+                    "qq_id": qq_id,
+                },
+            ))
+            self._reply(200, {"task_id": task_id})
+        except Exception as e:
+            self._reply(400, {"error": str(e)})
+        finally:
+            loop.close()
+
+    def _handle_cron_list(self, body: dict):
+        app = _app_ref
+        if not app or not app.scheduler:
+            self._reply(500, {"error": "scheduler not available"})
+            return
+
+        loop = asyncio.new_event_loop()
+        try:
+            all_tasks = loop.run_until_complete(
+                app.scheduler.list_tasks(owner_id=body.get("owner_id"))
+            )
+            llm_tasks = []
+            for t in all_tasks:
+                if t.get("task_type") == "llm":
+                    import json as _json
+                    params = _json.loads(t.get("params", "{}")) if isinstance(t.get("params"), str) else t.get("params", {})
+                    llm_tasks.append({
+                        "id": t["id"],
+                        "name": t["name"],
+                        "cron": t["cron_expr"],
+                        "prompt": params.get("prompt", ""),
+                        "recurring": params.get("recurring", True),
+                        "target_id": t["target_id"],
+                    })
+            self._reply(200, {"tasks": llm_tasks})
+        except Exception as e:
+            self._reply(400, {"error": str(e)})
+        finally:
+            loop.close()
+
+    def _handle_cron_delete(self, body: dict):
         app = _app_ref
         if not app or not app.scheduler:
             self._reply(500, {"error": "scheduler not available"})

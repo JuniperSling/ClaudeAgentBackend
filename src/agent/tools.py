@@ -49,119 +49,6 @@ def _api_call(path: str, body: dict) -> dict:
 
 
 @tool(
-    "create_scheduled_task",
-    "Create a scheduled task that runs on a cron schedule. "
-    "The task will execute a Python script and send its stdout as a QQ message. "
-    "cron_expr uses 5-field cron format: minute hour day month weekday. "
-    "Examples: '*/1 * * * *' = every minute, '*/30 * * * *' = every 30 min, "
-    "'0 9 * * *' = daily 9am. Minimum interval is 1 minute. "
-    "By default, messages are sent back to the same chat (group or private) "
-    "where the user made the request. Only set target_override if the user "
-    "explicitly asks to send to a different place.",
-    {
-        "name": str,
-        "cron_expr": str,
-        "script_content": str,
-        "target_override": str,
-    },
-)
-async def create_scheduled_task(args: dict[str, Any]) -> dict[str, Any]:
-    if not _current_user_id:
-        return _error("User context not available")
-
-    import os
-    script_dir = f"/app/data/tasks/{_current_user_id}"
-    os.makedirs(script_dir, exist_ok=True)
-
-    import uuid
-    script_filename = f"{uuid.uuid4().hex[:8]}.py"
-    script_path = os.path.join(script_dir, script_filename)
-
-    with open(script_path, "w") as f:
-        f.write(args["script_content"])
-
-    target_override = args.get("target_override", "").strip()
-    if target_override:
-        target_id = target_override
-    elif _current_session_key:
-        parts = _current_session_key.split(":", 2)
-        if len(parts) == 3 and parts[1] == "group":
-            target_id = f"group:{parts[2]}"
-        else:
-            target_id = _current_user_qq
-    else:
-        target_id = _current_user_qq
-
-    result = _api_call("/task/add", {
-        "owner_id": _current_user_id,
-        "name": args["name"],
-        "cron_expr": args["cron_expr"],
-        "target_channel": "qq",
-        "target_id": target_id,
-        "task_type": "script",
-        "params": {"script_filename": script_filename},
-        "script_path": script_path,
-    })
-
-    if "error" in result:
-        return _error(result["error"])
-
-    target_desc = "当前群聊" if target_id.startswith("group:") else f"私聊 {target_id}"
-    return _ok(
-        f"Task created successfully!\n"
-        f"  ID: {result['task_id']}\n"
-        f"  Name: {args['name']}\n"
-        f"  Schedule: {args['cron_expr']}\n"
-        f"  Target: {target_desc}"
-    )
-
-
-@tool(
-    "list_my_tasks",
-    "List all scheduled tasks owned by the current user.",
-    {},
-)
-async def list_my_tasks(args: dict[str, Any]) -> dict[str, Any]:
-    if not _current_user_id:
-        return _error("User context not available")
-
-    result = _api_call("/task/list", {"owner_id": _current_user_id})
-    if "error" in result:
-        return _error(result["error"])
-
-    tasks = result.get("tasks", [])
-    if not tasks:
-        return _ok("No scheduled tasks found.")
-
-    lines = []
-    for t in tasks:
-        lines.append(
-            f"- [{t['id']}] {t['name']}\n"
-            f"  Schedule: {t['cron_expr']} | Status: {t['status']}\n"
-            f"  Target: {t['target_channel']}:{t['target_id']}"
-        )
-    return _ok(f"Found {len(tasks)} task(s):\n\n" + "\n\n".join(lines))
-
-
-@tool(
-    "delete_scheduled_task",
-    "Delete a scheduled task by its ID. Only tasks owned by the current user can be deleted.",
-    {"task_id": str},
-)
-async def delete_scheduled_task(args: dict[str, Any]) -> dict[str, Any]:
-    if not _current_user_id:
-        return _error("User context not available")
-
-    result = _api_call("/task/delete", {
-        "task_id": args["task_id"],
-        "owner_id": _current_user_id,
-    })
-    if "error" in result:
-        return _error(result["error"])
-    return _ok(f"Task {args['task_id']} deleted successfully.")
-
-
-@tool(
     "get_current_user_info",
     "Get information about the current user (QQ ID, nickname, role).",
     {},
@@ -269,9 +156,6 @@ async def send_file_to_chat(args: dict[str, Any]) -> dict[str, Any]:
 
 
 ALL_TOOLS = [
-    create_scheduled_task,
-    list_my_tasks,
-    delete_scheduled_task,
     get_current_user_info,
     web_search,
     web_fetch,

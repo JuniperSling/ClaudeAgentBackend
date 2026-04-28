@@ -13,9 +13,10 @@ logger = logging.getLogger(__name__)
 
 
 class TaskScheduler:
-    def __init__(self, send_func=None):
+    def __init__(self, send_func=None, llm_runner=None):
         self._scheduler = AsyncIOScheduler()
         self._send_func = send_func
+        self._llm_runner = llm_runner
 
     async def start(self):
         await self._load_tasks_from_db()
@@ -29,6 +30,10 @@ class TaskScheduler:
     def set_send_func(self, send_func):
         """Set the function used to send messages: async def send(channel, target_id, text)"""
         self._send_func = send_func
+
+    def set_llm_runner(self, llm_runner):
+        """Set the LLM task runner: async def run(task: dict)"""
+        self._llm_runner = llm_runner
 
     async def add_task(
         self,
@@ -62,8 +67,11 @@ class TaskScheduler:
         )
         await db.commit()
 
-        self._register_job(task_id, cron_expr, target_channel, target_id, script_path, params or {})
-        logger.info("Task added: %s (%s) by %s", task_id, name, owner_id)
+        self._register_job(
+            task_id, cron_expr, target_channel, target_id,
+            script_path, params or {}, task_type, owner_id,
+        )
+        logger.info("Task added: %s (%s, type=%s) by %s", task_id, name, task_type, owner_id)
         return task_id
 
     async def remove_task(self, task_id: str, owner_id: str | None = None):
@@ -123,6 +131,7 @@ class TaskScheduler:
                 task["id"], task["cron_expr"],
                 task["target_channel"], task["target_id"],
                 task.get("script_path"), json.loads(task.get("params", "{}")),
+                task.get("task_type", "custom"), task.get("owner_id", ""),
             )
         logger.info("Loaded %d tasks from database", len(rows))
 
@@ -130,6 +139,7 @@ class TaskScheduler:
         self, task_id: str, cron_expr: str,
         target_channel: str, target_id: str,
         script_path: str | None, params: dict,
+        task_type: str = "custom", owner_id: str = "",
     ):
         cron_parts = cron_expr.split()
         if len(cron_parts) == 5:
@@ -152,17 +162,35 @@ class TaskScheduler:
                 "target_id": target_id,
                 "script_path": script_path,
                 "params": params,
+                "task_type": task_type,
+                "owner_id": owner_id,
             },
         )
 
     async def _execute_task(
         self, task_id: str, target_channel: str, target_id: str,
         script_path: str | None, params: dict,
+        task_type: str = "custom", owner_id: str = "",
     ):
-        logger.info("Executing task: %s", task_id)
+        logger.info("Executing task: %s (type=%s)", task_id, task_type)
         config = get_config()
 
         try:
+            if task_type == "llm":
+                if self._llm_runner:
+                    await self._llm_runner({
+                        "task_id": task_id,
+                        "owner_id": owner_id,
+                        "target_channel": target_channel,
+                        "target_id": target_id,
+                        "params": params,
+                    })
+
+                if not params.get("recurring", True):
+                    await self.remove_task(task_id)
+                    logger.info("One-shot LLM task auto-deleted: %s", task_id)
+                return
+
             if script_path:
                 result = await asyncio.wait_for(
                     self._run_script(script_path, params, config.data_dir),

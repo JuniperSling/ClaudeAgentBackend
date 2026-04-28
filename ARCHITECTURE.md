@@ -76,25 +76,57 @@ QQBot.send_text() → 发送回复 (引用原消息)
 
 ### 2.3 MCP 工具 (`agent/tools.py`)
 
-职责：定义 Agent 可调用的自定义工具。
+职责：定义 Agent 可调用的自定义工具，补充 SDK 内置工具的不足。
 
 关键设计：
 - **工具在 Claude Code CLI 子进程中执行**：无法直接访问主进程内存，通过 Internal HTTP API（127.0.0.1:9199）回调
-- **上下文传递**：`set_context(user, session_key)` 在每次 Agent 调用前设置，工具通过全局变量读取。因为 MCP 工具是进程内执行的（SDK MCP Server），全局变量在子进程 fork 时会被复制
+- **上下文传递**：`set_context(user, session_key)` 在每次 Agent 调用前设置，工具通过全局变量读取
 - **web_search**：调用 Serper API（Google 搜索），返回 answerBox + knowledgeGraph + organic results
-- **create_scheduled_task**：根据 session_key 自动判断目标（群聊→群，私聊→用户），生成 Python 脚本保存到 tasks 目录
+- **web_fetch**：抓取任意网页内容（智谱模型下 SDK 内置 WebFetch 不可靠，自实现）
 - **send_file_to_chat**：通过 Internal API → QQBot._send_file_sync() → NapCat upload_private_file/upload_group_file
+- **get_current_user_info**：返回当前用户信息
 
-### 2.4 Internal HTTP API (`services/internal_api.py`)
+定时任务相关工具**不再由我们自己实现**——见 2.4 节，通过拦截 SDK 内置 Cron 工具实现。
 
-职责：MCP 工具跨进程调用主进程的桥梁。
+### 2.4 SDK 内置 Cron 工具拦截（PreToolUse Hook）
 
-运行方式：在主进程中启动一个 threading.HTTPServer（端口 9199），MCP 工具通过 urllib 同步调用。
+Claude Code CLI 内置了 `CronCreate`/`CronList`/`CronDelete` 工具，但它们的 cron 数据存在 CLI 子进程内存里，进程退出就丢失。我们通过 SDK 的 `hooks` 机制拦截这些工具调用，转发到自己的 `TaskScheduler`：
+
+```python
+async def cron_create_hook(input_data, tool_use_id, context):
+    args = input_data["tool_input"]
+    # args = {"cron": "...", "recurring": false, "prompt": "..."}
+    result = _api_post("/cron/create", {...})
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",  # 阻止 CLI 真实执行
+            "permissionDecisionReason": "已创建定时任务...",  # 反馈给 Agent
+        }
+    }
+```
+
+任务被拦截后存到 SQLite，APScheduler 触发时启动一个新的 ClaudeSDKClient，把 cron 的 `prompt` 字段作为 user_message 发进去。Agent 输出的最终 text 自动发到 target_id（私聊或群聊，由创建时的 session_key 推导）。
+
+优势：
+- Agent 用 SDK 原生 Cron 工具，体验自然
+- 持久化、用户隔离、跨进程都保留
+- 一次性任务（`recurring=false`）执行后自动删除
+- LLM 触发的"智能任务"——比如"每天 9 点用 web_search 查天气并发我"，触发时 Agent 会自动用工具搜索最新信息
+
+### 2.5 Internal HTTP API (`services/internal_api.py`)
+
+职责：MCP 工具跨进程调用主进程的桥梁，以及 hook 转发到 TaskScheduler 的桥梁。
+
+运行方式：在主进程中启动一个 threading.HTTPServer（端口 9199），通过 urllib 同步调用。
 
 端点：
-- POST /task/add → TaskScheduler.add_task()
+- POST /task/add → TaskScheduler.add_task()（旧 script 任务）
 - POST /task/list → TaskScheduler.list_tasks()
 - POST /task/delete → TaskScheduler.remove_task()
+- POST /cron/create → 创建 LLM-prompt 任务（hook 调用）
+- POST /cron/list → 列出 LLM 任务
+- POST /cron/delete → 删除任务
 - POST /user/info → UserManager.get_by_qq_id()
 - POST /file/send → QQBot._send_file_sync()
 - POST /msg/send → 发送文本消息
@@ -103,7 +135,7 @@ QQBot.send_text() → 发送回复 (引用原消息)
 - 使用 `asyncio.new_event_loop()` 在同步线程中运行异步代码
 - 文件发送必须用同步方法（`_send_file_sync`），避免事件循环冲突
 
-### 2.5 文件处理 (`services/file_handler.py`)
+### 2.6 文件处理 (`services/file_handler.py`)
 
 职责：从 NapCat 下载文件，提取文本内容。
 
@@ -115,25 +147,30 @@ QQBot.send_text() → 发送回复 (引用原消息)
 
 文本提取支持：docx (python-docx)、xlsx (openpyxl)、pdf (PyPDF2)、纯文本文件
 
-### 2.6 定时任务 (`scheduler/manager.py`)
+### 2.7 定时任务 (`scheduler/manager.py`)
 
-职责：管理 cron 定时任务的 CRUD 和执行。
+职责：管理 cron 定时任务的 CRUD 和执行。支持两种任务类型：
+- **script 任务**：执行 Python 脚本，stdout 作为消息发送（旧式）
+- **llm 任务**：触发时启动 Agent，把 prompt 作为 user_message（推荐，由 CronCreate hook 创建）
 
 关键设计：
 - **APScheduler AsyncIOScheduler**：异步调度器，支持 cron 表达式
 - **SQLite 持久化**：任务信息存数据库，启动时 `_load_tasks_from_db()` 恢复所有 active 任务
-- **subprocess 执行脚本**：`_run_script()` 在子进程中运行 Python 脚本，stdout 作为消息发送
+- **task_type 字段区分执行方式**：
+  - `script` → `_run_script()` 在子进程中运行 Python 脚本，stdout 作为消息
+  - `llm` → 调用 `_llm_runner` 钩子（main.py 中的 `_scheduler_run_llm`），启动 Agent
+- **一次性任务**：`params.recurring=False` 时，执行后自动删除
 - **任务清理**：删除任务时同步删除脚本文件
-- **[at:QQ号] 支持**：脚本 stdout 中的 `[at:123]` 会被解析为 QQ @消息
+- **[at:QQ号] 支持**：脚本/LLM stdout 中的 `[at:123]` 会被解析为 QQ @消息
 
-### 2.7 数据库 (`services/database.py`)
+### 2.8 数据库 (`services/database.py`)
 
 三张表：
 - **users**：qq_id (唯一)、password_hash (bcrypt)、role (admin/user)、max_tasks
-- **sessions**：channel + channel_session_id (唯一索引)、history (JSON)、last_active
-- **tasks**：owner_id (外键)、cron_expr、script_path、target_channel、target_id、status
+- **sessions**：channel + channel_session_id (唯一索引)、history (JSON)、agent_session_id (SDK session resume)、last_active
+- **tasks**：owner_id (外键)、task_type (script/llm/custom)、cron_expr、params (JSON)、target_channel、target_id、script_path、status
 
-QQ 渠道用户自动注册（首次发消息创建），密码随机生成用于未来 Web 端登录。
+QQ 渠道用户自动注册（首次发消息创建），密码随机生成用于未来 Web 端登录。会话历史不再手动拼接到 prompt，改用 SDK 的 `resume=session_id` 参数续传。
 
 ## 3. Docker 架构
 

@@ -30,6 +30,7 @@ class SessionManager:
             ) > timedelta(hours=self.ttl_hours):
                 await self._reset_history(session["id"])
                 session["history"] = "[]"
+                session["agent_session_id"] = None
                 logger.info("Session expired, reset: %s", session["id"])
             return session
 
@@ -83,7 +84,7 @@ class SessionManager:
     async def _reset_history(self, session_id: str):
         db = await get_db()
         await db.execute(
-            "UPDATE sessions SET history = '[]', last_active = datetime('now') WHERE id = ?",
+            "UPDATE sessions SET history = '[]', agent_session_id = NULL, last_active = datetime('now') WHERE id = ?",
             (session_id,),
         )
         await db.commit()
@@ -91,3 +92,20 @@ class SessionManager:
     async def clear_session(self, session_id: str):
         await self._reset_history(session_id)
         logger.info("Session cleared: %s", session_id)
+
+    async def get_agent_session_id(self, session_id: str) -> str | None:
+        db = await get_db()
+        rows = await db.execute_fetchall(
+            "SELECT agent_session_id FROM sessions WHERE id = ?", (session_id,)
+        )
+        if rows:
+            return rows[0]["agent_session_id"]
+        return None
+
+    async def set_agent_session_id(self, session_id: str, agent_session_id: str):
+        db = await get_db()
+        await db.execute(
+            "UPDATE sessions SET agent_session_id = ?, last_active = datetime('now') WHERE id = ?",
+            (agent_session_id, session_id),
+        )
+        await db.commit()
