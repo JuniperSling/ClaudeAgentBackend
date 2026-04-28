@@ -38,13 +38,7 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length)) if length else {}
 
-        if self.path == "/task/add":
-            self._handle_task_add(body)
-        elif self.path == "/task/list":
-            self._handle_task_list(body)
-        elif self.path == "/task/delete":
-            self._handle_task_delete(body)
-        elif self.path == "/cron/create":
+        if self.path == "/cron/create":
             self._handle_cron_create(body)
         elif self.path == "/cron/list":
             self._handle_cron_list(body)
@@ -58,64 +52,6 @@ class _Handler(BaseHTTPRequestHandler):
             self._handle_msg_send(body)
         else:
             self._reply(404, {"error": "not found"})
-
-    def _handle_task_add(self, body: dict):
-        app = _app_ref
-        if not app or not app.scheduler:
-            self._reply(500, {"error": "scheduler not available"})
-            return
-
-        loop = asyncio.new_event_loop()
-        try:
-            task_id = loop.run_until_complete(app.scheduler.add_task(
-                owner_id=body["owner_id"],
-                name=body["name"],
-                cron_expr=body["cron_expr"],
-                target_channel=body.get("target_channel", "qq"),
-                target_id=body["target_id"],
-                task_type=body.get("task_type", "script"),
-                params=body.get("params"),
-                script_path=body.get("script_path"),
-            ))
-            self._reply(200, {"task_id": task_id})
-        except Exception as e:
-            self._reply(400, {"error": str(e)})
-        finally:
-            loop.close()
-
-    def _handle_task_list(self, body: dict):
-        app = _app_ref
-        if not app or not app.scheduler:
-            self._reply(500, {"error": "scheduler not available"})
-            return
-
-        loop = asyncio.new_event_loop()
-        try:
-            tasks = loop.run_until_complete(
-                app.scheduler.list_tasks(owner_id=body.get("owner_id"))
-            )
-            self._reply(200, {"tasks": tasks})
-        except Exception as e:
-            self._reply(400, {"error": str(e)})
-        finally:
-            loop.close()
-
-    def _handle_task_delete(self, body: dict):
-        app = _app_ref
-        if not app or not app.scheduler:
-            self._reply(500, {"error": "scheduler not available"})
-            return
-
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(
-                app.scheduler.remove_task(body["task_id"], owner_id=body.get("owner_id"))
-            )
-            self._reply(200, {"ok": True})
-        except Exception as e:
-            self._reply(400, {"error": str(e)})
-        finally:
-            loop.close()
 
     def _handle_cron_create(self, body: dict):
         """Create LLM-prompt task. body: {owner_id, qq_id, session_key, cron, recurring, prompt, name}"""
@@ -152,7 +88,6 @@ class _Handler(BaseHTTPRequestHandler):
                 cron_expr=cron,
                 target_channel="qq",
                 target_id=target_id,
-                task_type="llm",
                 params={
                     "prompt": prompt,
                     "recurring": recurring,
@@ -178,20 +113,18 @@ class _Handler(BaseHTTPRequestHandler):
             all_tasks = loop.run_until_complete(
                 app.scheduler.list_tasks(owner_id=body.get("owner_id"))
             )
-            llm_tasks = []
+            tasks = []
             for t in all_tasks:
-                if t.get("task_type") == "llm":
-                    import json as _json
-                    params = _json.loads(t.get("params", "{}")) if isinstance(t.get("params"), str) else t.get("params", {})
-                    llm_tasks.append({
-                        "id": t["id"],
-                        "name": t["name"],
-                        "cron": t["cron_expr"],
-                        "prompt": params.get("prompt", ""),
-                        "recurring": params.get("recurring", True),
-                        "target_id": t["target_id"],
-                    })
-            self._reply(200, {"tasks": llm_tasks})
+                params = json.loads(t.get("params", "{}")) if isinstance(t.get("params"), str) else (t.get("params") or {})
+                tasks.append({
+                    "id": t["id"],
+                    "name": t["name"],
+                    "cron": t["cron_expr"],
+                    "prompt": params.get("prompt", ""),
+                    "recurring": params.get("recurring", True),
+                    "target_id": t["target_id"],
+                })
+            self._reply(200, {"tasks": tasks})
         except Exception as e:
             self._reply(400, {"error": str(e)})
         finally:

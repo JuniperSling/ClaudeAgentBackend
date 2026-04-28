@@ -6,40 +6,14 @@ import re
 import time
 from typing import Callable, Awaitable
 
-import urllib.request
-
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
-    HookMatcher,
     create_sdk_mcp_server,
 )
 
 from src.config import get_config, get_env, get_active_model, get_model_env
 from src.agent.tools import ALL_TOOLS, MCP_SERVER_NAME, TOOL_NAMES, set_context
-
-INTERNAL_API = "http://127.0.0.1:9199"
-
-
-def _api_post(path: str, body: dict) -> dict:
-    """Sync HTTP POST to internal API (for use in hooks)."""
-    data = json.dumps(body).encode()
-    req = urllib.request.Request(
-        f"{INTERNAL_API}{path}",
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        try:
-            return json.loads(e.read().decode())
-        except Exception:
-            return {"error": str(e)}
-    except Exception as e:
-        return {"error": str(e)}
 
 logger = logging.getLogger(__name__)
 
@@ -107,85 +81,6 @@ class AgentRunner:
         sys_prompt = system_prompt or SYSTEM_PROMPT
         logger.info("Using model: %s, resume=%s", active_model, resume_session_id[:8] if resume_session_id else None)
 
-        owner_id = user["id"] if user else ""
-        qq_id = user["qq_id"] if user else ""
-        sk = session_key or ""
-
-        async def cron_create_hook(input_data, tool_use_id, context):
-            args = input_data.get("tool_input", {})
-            cron = args.get("cron", "")
-            recurring = args.get("recurring", True)
-            prompt_text = args.get("prompt", "")
-
-            result = _api_post("/cron/create", {
-                "owner_id": owner_id,
-                "qq_id": qq_id,
-                "session_key": sk,
-                "cron": cron,
-                "recurring": recurring,
-                "prompt": prompt_text,
-            })
-            if "error" in result:
-                reason = f"任务创建失败: {result['error']}"
-            else:
-                tid = result.get("task_id", "")
-                target = "当前群聊" if sk.startswith("qq:group:") else "私聊"
-                schedule = "一次性" if not recurring else "周期性"
-                reason = f"已创建{schedule}定时任务 {tid}\nCron: {cron}\n触发指令: {prompt_text[:60]}\n发送目标: {target}"
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                }
-            }
-
-        async def cron_list_hook(input_data, tool_use_id, context):
-            result = _api_post("/cron/list", {"owner_id": owner_id})
-            if "error" in result:
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": f"列任务失败: {result['error']}",
-                    }
-                }
-            tasks = result.get("tasks", [])
-            if not tasks:
-                reason = "当前没有定时任务"
-            else:
-                lines = []
-                for t in tasks:
-                    schedule = "一次性" if not t.get("recurring", True) else "周期"
-                    lines.append(f"[{t['id']}] {schedule} | {t['cron']} | {t['prompt'][:50]}")
-                reason = "当前定时任务:\n" + "\n".join(lines)
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                }
-            }
-
-        async def cron_delete_hook(input_data, tool_use_id, context):
-            args = input_data.get("tool_input", {})
-            task_id = args.get("id") or args.get("task_id") or ""
-            result = _api_post("/cron/delete", {
-                "owner_id": owner_id,
-                "task_id": task_id,
-            })
-            if "error" in result:
-                reason = f"删除失败: {result['error']}"
-            else:
-                reason = f"已删除任务 {task_id}"
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                }
-            }
-
         options_kwargs = dict(
             model=active_model,
             max_turns=self.config.model.max_turns,
@@ -193,13 +88,7 @@ class AgentRunner:
             cwd=user_workspace,
             mcp_servers={MCP_SERVER_NAME: self._mcp_server},
             system_prompt={"type": "preset", "preset": "claude_code", "append": sys_prompt},
-            hooks={
-                "PreToolUse": [
-                    HookMatcher(matcher="CronCreate", hooks=[cron_create_hook]),
-                    HookMatcher(matcher="CronList", hooks=[cron_list_hook]),
-                    HookMatcher(matcher="CronDelete", hooks=[cron_delete_hook]),
-                ],
-            },
+            disallowed_tools=["CronCreate", "CronList", "CronDelete"],
         )
         if resume_session_id:
             options_kwargs["resume"] = resume_session_id

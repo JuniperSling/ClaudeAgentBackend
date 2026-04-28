@@ -42,7 +42,7 @@ MODEL_PRESETS: dict[str, ModelPreset] = {
 
 
 class ModelConfig(BaseModel):
-    name: str = "glm-5.1"
+    name: str = "deepseek-v4-flash"
     max_turns: int = 30
 
 

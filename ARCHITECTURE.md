@@ -86,47 +86,38 @@ QQBot.send_text() → 发送回复 (引用原消息)
 - **send_file_to_chat**：通过 Internal API → QQBot._send_file_sync() → NapCat upload_private_file/upload_group_file
 - **get_current_user_info**：返回当前用户信息
 
-定时任务相关工具**不再由我们自己实现**——见 2.4 节，通过拦截 SDK 内置 Cron 工具实现。
+### 2.4 定时任务工具（MCP）
 
-### 2.4 SDK 内置 Cron 工具拦截（PreToolUse Hook）
+定时任务相关工具完全由我们自己实现：`create_scheduled_task` / `list_my_tasks` / `delete_scheduled_task`。
 
-Claude Code CLI 内置了 `CronCreate`/`CronList`/`CronDelete` 工具，但它们的 cron 数据存在 CLI 子进程内存里，进程退出就丢失。我们通过 SDK 的 `hooks` 机制拦截这些工具调用，转发到自己的 `TaskScheduler`：
+**为什么不直接用 SDK 内置 CronCreate/CronList/CronDelete？**
 
-```python
-async def cron_create_hook(input_data, tool_use_id, context):
-    args = input_data["tool_input"]
-    # args = {"cron": "...", "recurring": false, "prompt": "..."}
-    result = _api_post("/cron/create", {...})
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",  # 阻止 CLI 真实执行
-            "permissionDecisionReason": "已创建定时任务...",  # 反馈给 Agent
-        }
-    }
-```
+研究后发现 SDK 的 cron 系统存在三个问题让它不能直接用：
+1. **执行依赖 CLI 持续运行**：SDK cron "Jobs only fire while the REPL is idle"，依赖 Claude Code 交互式 CLI 持续运行才会触发。我们用的 `ClaudeSDKClient` 每次 query 完就退出，**SDK 自己永远不会触发任何任务**
+2. **7 天自动过期**：SDK 内置 `recurringMaxAgeMs/86400000` 自动清理"老旧"任务，对长期 daemon 任务不友好
+3. **触发时间 jitter**：SDK 故意在用户指定的时间上加抖动（"recurring tasks fire up to 10% of their period late"），我们需要精确触发
 
-任务被拦截后存到 SQLite，APScheduler 触发时启动一个新的 ClaudeSDKClient，把 cron 的 `prompt` 字段作为 user_message 发进去。Agent 输出的最终 text 自动发到 target_id（私聊或群聊，由创建时的 session_key 推导）。
+所以方案是：**用 `disallowed_tools=["CronCreate", "CronList", "CronDelete"]` 屏蔽 SDK 内置工具，由 MCP 工具完全替代**。Agent 看到的工具描述风格和参数语义参考 SDK 内置工具，体验差异很小。
 
-优势：
-- Agent 用 SDK 原生 Cron 工具，体验自然
-- 持久化、用户隔离、跨进程都保留
-- 一次性任务（`recurring=false`）执行后自动删除
-- LLM 触发的"智能任务"——比如"每天 9 点用 web_search 查天气并发我"，触发时 Agent 会自动用工具搜索最新信息
+任务流程：
+1. Agent 调用 `create_scheduled_task(cron_expr, prompt, recurring, name)` → MCP 工具通过 internal API 写入 SQLite
+2. APScheduler 注册 cron job，到点触发
+3. `_scheduler_run_llm` 启动新的 ClaudeSDKClient，把存的 prompt 作为 user_message 发入
+4. Agent 输出最终 text → 自动发到任务创建时所在的对话（私聊/群聊）
+5. 一次性任务执行后自动删除
+
+智能任务示例：用户说"每天 9 点用 web_search 查深圳天气然后发到群里"——任务存的 prompt 触发时让 Agent 实时搜索最新天气，而不是死板地输出固定文案。
 
 ### 2.5 Internal HTTP API (`services/internal_api.py`)
 
-职责：MCP 工具跨进程调用主进程的桥梁，以及 hook 转发到 TaskScheduler 的桥梁。
+职责：MCP 工具（运行在 CLI 子进程）跨进程调用主进程的桥梁。
 
 运行方式：在主进程中启动一个 threading.HTTPServer（端口 9199），通过 urllib 同步调用。
 
 端点：
-- POST /task/add → TaskScheduler.add_task()（旧 script 任务）
-- POST /task/list → TaskScheduler.list_tasks()
-- POST /task/delete → TaskScheduler.remove_task()
-- POST /cron/create → 创建 LLM-prompt 任务（hook 调用）
-- POST /cron/list → 列出 LLM 任务
-- POST /cron/delete → 删除任务
+- POST /cron/create → 创建定时任务
+- POST /cron/list → 列出当前用户所有任务
+- POST /cron/delete → 取消任务
 - POST /user/info → UserManager.get_by_qq_id()
 - POST /file/send → QQBot._send_file_sync()
 - POST /msg/send → 发送文本消息
@@ -149,26 +140,22 @@ async def cron_create_hook(input_data, tool_use_id, context):
 
 ### 2.7 定时任务 (`scheduler/manager.py`)
 
-职责：管理 cron 定时任务的 CRUD 和执行。支持两种任务类型：
-- **script 任务**：执行 Python 脚本，stdout 作为消息发送（旧式）
-- **llm 任务**：触发时启动 Agent，把 prompt 作为 user_message（推荐，由 CronCreate hook 创建）
+职责：管理 LLM-prompt 定时任务的 CRUD 和执行。
 
 关键设计：
 - **APScheduler AsyncIOScheduler**：异步调度器，支持 cron 表达式
 - **SQLite 持久化**：任务信息存数据库，启动时 `_load_tasks_from_db()` 恢复所有 active 任务
-- **task_type 字段区分执行方式**：
-  - `script` → `_run_script()` 在子进程中运行 Python 脚本，stdout 作为消息
-  - `llm` → 调用 `_llm_runner` 钩子（main.py 中的 `_scheduler_run_llm`），启动 Agent
+- **触发时调用 LLM**：到点时调用 `_llm_runner` 钩子（main.py 中的 `_scheduler_run_llm`），启动新的 ClaudeSDKClient，把存的 prompt 作为 user_message
 - **一次性任务**：`params.recurring=False` 时，执行后自动删除
-- **任务清理**：删除任务时同步删除脚本文件
-- **[at:QQ号] 支持**：脚本/LLM stdout 中的 `[at:123]` 会被解析为 QQ @消息
+- **Cron 校验**：`_register_job` 创建时会用 `trigger.get_next_fire_time()` 验证 cron 是否有可触发时间，写错的（如 day+weekday 永不同时为真）会立即报错让 Agent 重试
+- **[at:QQ号] 支持**：LLM 输出中的 `[at:123]` 会被 QQBot 解析为 QQ @消息
 
 ### 2.8 数据库 (`services/database.py`)
 
 三张表：
 - **users**：qq_id (唯一)、password_hash (bcrypt)、role (admin/user)、max_tasks
 - **sessions**：channel + channel_session_id (唯一索引)、history (JSON)、agent_session_id (SDK session resume)、last_active
-- **tasks**：owner_id (外键)、task_type (script/llm/custom)、cron_expr、params (JSON)、target_channel、target_id、script_path、status
+- **tasks**：owner_id (外键)、task_type、cron_expr、params (JSON 存 prompt/recurring/session_key 等)、target_channel、target_id、status
 
 QQ 渠道用户自动注册（首次发消息创建），密码随机生成用于未来 Web 端登录。会话历史不再手动拼接到 prompt，改用 SDK 的 `resume=session_id` 参数续传。
 

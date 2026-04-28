@@ -1,5 +1,5 @@
 model:
-  name: "glm-4.5-flash"
+  name: "deepseek-v4-flash"
   max_turns: 30
 
 napcat:

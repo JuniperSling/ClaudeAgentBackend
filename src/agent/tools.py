@@ -49,6 +49,87 @@ def _api_call(path: str, body: dict) -> dict:
 
 
 @tool(
+    "create_scheduled_task",
+    "Schedule a recurring or one-shot prompt. At each fire time, the prompt is "
+    "enqueued as a new user message and the agent's reply is sent back to the chat "
+    "where this task was created. Returns a job ID you can pass to delete_scheduled_task. "
+    "cron_expr: standard 5-field cron expression in local time \"M H DoM Mon DoW\" "
+    "(e.g. \"*/5 * * * *\" = every 5 minutes, \"30 14 28 2 *\" = Feb 28 at 2:30pm). "
+    "prompt: the prompt to enqueue at each fire time. "
+    "recurring: true = fire on every cron match until deleted, false = fire once and auto-delete.",
+    {"cron_expr": str, "prompt": str, "recurring": bool, "name": str},
+)
+async def create_scheduled_task(args: dict[str, Any]) -> dict[str, Any]:
+    if not _current_user_id:
+        return _error("User context not available")
+
+    result = _api_call("/cron/create", {
+        "owner_id": _current_user_id,
+        "qq_id": _current_user_qq,
+        "session_key": _current_session_key,
+        "cron": args["cron_expr"],
+        "recurring": args.get("recurring", True),
+        "prompt": args["prompt"],
+        "name": args.get("name") or args["prompt"][:30],
+    })
+    if "error" in result:
+        return _error(result["error"])
+
+    target = "当前群聊" if _current_session_key.startswith("qq:group:") else "私聊"
+    schedule = "一次性" if not args.get("recurring", True) else "周期性"
+    return _ok(
+        f"已创建{schedule}定时任务\n"
+        f"  ID: {result['task_id']}\n"
+        f"  Cron: {args['cron_expr']}\n"
+        f"  发送目标: {target}"
+    )
+
+
+@tool(
+    "list_my_tasks",
+    "List all active scheduled tasks.",
+    {},
+)
+async def list_my_tasks(args: dict[str, Any]) -> dict[str, Any]:
+    if not _current_user_id:
+        return _error("User context not available")
+
+    result = _api_call("/cron/list", {"owner_id": _current_user_id})
+    if "error" in result:
+        return _error(result["error"])
+
+    tasks = result.get("tasks", [])
+    if not tasks:
+        return _ok("当前没有定时任务")
+
+    lines = []
+    for t in tasks:
+        schedule = "一次性" if not t.get("recurring", True) else "周期"
+        target_id = t.get("target_id", "")
+        target_desc = f"群{target_id[6:]}" if target_id.startswith("group:") else f"私聊"
+        lines.append(f"[{t['id']}] {schedule} | {t['cron']} | {target_desc} | {t['prompt'][:50]}")
+    return _ok("当前定时任务:\n" + "\n".join(lines))
+
+
+@tool(
+    "delete_scheduled_task",
+    "Cancel a scheduled task previously created with create_scheduled_task.",
+    {"task_id": str},
+)
+async def delete_scheduled_task(args: dict[str, Any]) -> dict[str, Any]:
+    if not _current_user_id:
+        return _error("User context not available")
+
+    result = _api_call("/cron/delete", {
+        "owner_id": _current_user_id,
+        "task_id": args["task_id"],
+    })
+    if "error" in result:
+        return _error(result["error"])
+    return _ok(f"已删除任务 {args['task_id']}")
+
+
+@tool(
     "get_current_user_info",
     "Get information about the current user (QQ ID, nickname, role).",
     {},
@@ -66,8 +147,7 @@ async def get_current_user_info(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "web_search",
-    "Search the web using Google (via Serper API). Returns top results with titles, URLs and snippets. "
-    "Use this for weather, news, real-time info, or anything you need to look up.",
+    "Search the web using Google. Returns top results with titles, URLs and snippets.",
     {"query": str, "max_results": int},
 )
 async def web_search(args: dict[str, Any]) -> dict[str, Any]:
@@ -111,7 +191,7 @@ async def web_search(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "web_fetch",
-    "Fetch the text content of a webpage by URL. Useful for reading articles, documentation, etc.",
+    "Fetch the text content of a webpage by URL.",
     {"url": str},
 )
 async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
@@ -128,10 +208,8 @@ async def web_fetch(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "send_file_to_chat",
-    "Send a file to the current chat (or a specified target). "
-    "file_path must be an absolute path on the server. "
-    "If target_session is empty, the file is sent to the current conversation. "
-    "Use this after generating/processing a file that the user wants to receive.",
+    "Send a file to the chat. file_path must be an absolute path on the server. "
+    "Leave target_session empty to send to the current conversation.",
     {"file_path": str, "file_name": str, "target_session": str},
 )
 async def send_file_to_chat(args: dict[str, Any]) -> dict[str, Any]:
@@ -156,6 +234,9 @@ async def send_file_to_chat(args: dict[str, Any]) -> dict[str, Any]:
 
 
 ALL_TOOLS = [
+    create_scheduled_task,
+    list_my_tasks,
+    delete_scheduled_task,
     get_current_user_info,
     web_search,
     web_fetch,

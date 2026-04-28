@@ -52,7 +52,6 @@ class Application:
         )
 
         self.scheduler = TaskScheduler()
-        self.scheduler.set_send_func(self._scheduler_send)
         self.scheduler.set_llm_runner(self._scheduler_run_llm)
 
         await self.qq_bot.start(on_message=self.handle_message)
@@ -205,13 +204,18 @@ class Application:
             return True
 
         if cmd == "/tasks":
+            import json as _json
             tasks = await self.scheduler.list_tasks(owner_id=user["id"])
             if not tasks:
                 await self.qq_bot.send_text(msg.session_key, "暂无定时任务")
             else:
                 lines = ["📋 我的任务:"]
                 for t in tasks:
-                    lines.append(f"  [{t['id']}] {t['name']} - {t['cron_expr']} - {t['status']}")
+                    params = _json.loads(t.get("params") or "{}") if isinstance(t.get("params"), str) else (t.get("params") or {})
+                    schedule = "一次性" if not params.get("recurring", True) else "周期"
+                    target = t["target_id"]
+                    target_desc = f"群{target[6:]}" if target.startswith("group:") else f"私聊"
+                    lines.append(f"[{t['id']}] {schedule} | {t['cron_expr']} | {target_desc} | {t['name']}")
                 await self.qq_bot.send_text(msg.session_key, "\n".join(lines))
             return True
 

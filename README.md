@@ -192,22 +192,30 @@ Agent 通过 in-process MCP Server 注册自定义工具，工具在 Claude Code
 
 | 工具名 | 功能 |
 |--------|------|
-| web_search | Google 搜索（Serper API） |
-| web_fetch | 抓取网页内容 |
-| send_file_to_chat | 发送文件到当前 QQ 对话 |
-| get_current_user_info | 获取当前用户信息 |
+| `create_scheduled_task` | 创建定时任务（一次性或周期性 LLM-prompt 任务） |
+| `list_my_tasks` | 列出当前用户所有定时任务 |
+| `delete_scheduled_task` | 取消指定定时任务 |
+| `web_search` | Google 搜索（Serper API） |
+| `web_fetch` | 抓取网页内容 |
+| `send_file_to_chat` | 发送文件到 QQ 对话 |
+| `get_current_user_info` | 获取当前用户信息 |
 
-## SDK 内置工具拦截（Cron）
+SDK 内置的 `CronCreate` / `CronList` / `CronDelete` 通过 `disallowed_tools` 屏蔽，统一由我们的 MCP 工具承担。
 
-通过 PreToolUse hook 拦截 Claude Code CLI 内置的 `CronCreate`/`CronList`/`CronDelete` 工具，
-将它们转发到我们的 `TaskScheduler`：
+## 定时任务
 
-- **CronCreate**：用户说"X 时间提醒我 Y"时 Agent 会调用此工具，hook 把任务存到我们的数据库
-- **任务触发**：APScheduler 到点时启动新的 ClaudeSDKClient，把 cron 的 `prompt` 作为 user_message
-- **一次性任务**：`recurring=false` 时执行后自动删除
-- **session 路由**：任务的目标会话从创建时的 `session_key` 推导（私聊回私聊，群聊回群聊）
-| get_current_user_info | 获取当前用户信息 |
-| send_file_to_chat | 发送文件到 QQ 对话 |
+**LLM-prompt 任务**：用户说"X 时间提醒我做 Y"，Agent 调用 `create_scheduled_task`，把 cron 表达式和 prompt 存到 SQLite。
+
+**到点触发**：APScheduler 触发时，启动一个全新的 ClaudeSDKClient，把当时的 prompt 作为 user_message 发进去。Agent 输出的 reply 自动发到任务创建时所在的 QQ 对话（私聊或群聊）。
+
+**一次性任务**：`recurring=false` 时执行后自动删除。
+
+**所有权与目标分离**：
+- `owner_id` = 创建者用户 ID（决定谁能 list/delete）
+- `target_id` = 创建时所在对话（决定触发时发到哪儿）
+- 群里创建 → 群里收到，但只有创建者能管理
+
+**重启持久化**：服务重启后 `_load_tasks_from_db()` 会从 SQLite 把所有 active 任务重新注册到 APScheduler。
 
 ## 许可
 
