@@ -44,6 +44,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._handle_cron_list(body)
         elif self.path == "/cron/delete":
             self._handle_cron_delete(body)
+        elif self.path == "/cron/_inspect":
+            self._handle_cron_inspect(body)
         elif self.path == "/user/info":
             self._handle_user_info(body)
         elif self.path == "/file/send":
@@ -138,14 +140,55 @@ class _Handler(BaseHTTPRequestHandler):
 
         loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(
+            ok = loop.run_until_complete(
                 app.scheduler.remove_task(body["task_id"], owner_id=body.get("owner_id"))
             )
-            self._reply(200, {"ok": True})
+            if ok:
+                self._reply(200, {"ok": True})
+            else:
+                self._reply(404, {"error": "task not found or not owned by you"})
         except Exception as e:
             self._reply(400, {"error": str(e)})
         finally:
             loop.close()
+
+    def _handle_cron_inspect(self, body: dict):
+        """Debug: return APScheduler in-memory jobs vs DB active tasks for consistency check."""
+        app = _app_ref
+        if not app or not app.scheduler:
+            self._reply(500, {"error": "scheduler not available"})
+            return
+
+        try:
+            jobs = []
+            for job in app.scheduler._scheduler.get_jobs():
+                kwargs = job.kwargs or {}
+                jobs.append({
+                    "id": job.id,
+                    "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
+                    "trigger": str(job.trigger),
+                    "target_id": kwargs.get("target_id"),
+                    "owner_id": kwargs.get("owner_id"),
+                })
+
+            loop = asyncio.new_event_loop()
+            try:
+                db_active = loop.run_until_complete(app.scheduler.list_tasks())
+            finally:
+                loop.close()
+            db_ids = {t["id"] for t in db_active}
+            job_ids = {j["id"] for j in jobs}
+
+            self._reply(200, {
+                "jobs": jobs,
+                "db_active_ids": sorted(db_ids),
+                "scheduler_job_ids": sorted(job_ids),
+                "in_db_only": sorted(db_ids - job_ids),
+                "in_scheduler_only": sorted(job_ids - db_ids),
+                "consistent": db_ids == job_ids,
+            })
+        except Exception as e:
+            self._reply(400, {"error": str(e)})
 
     def _handle_user_info(self, body: dict):
         app = _app_ref

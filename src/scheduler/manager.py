@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import uuid
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -9,6 +10,22 @@ from src.config import get_config
 from src.services.database import get_db
 
 logger = logging.getLogger(__name__)
+
+
+# Standard cron uses 0=Sunday..6=Saturday (with 7 also Sunday), while
+# APScheduler's CronTrigger uses 0=Monday..6=Sunday. Translate the digits
+# in the day-of-week field to APScheduler's textual form so users can keep
+# writing crontab-style expressions like "0 10 * * 4" for Thursday.
+_DOW_DIGIT_TO_NAME = {
+    "0": "sun", "1": "mon", "2": "tue", "3": "wed",
+    "4": "thu", "5": "fri", "6": "sat", "7": "sun",
+}
+
+
+def _normalize_dow(field: str) -> str:
+    if not field or field in ("*", "?"):
+        return field
+    return re.sub(r"\d+", lambda m: _DOW_DIGIT_TO_NAME.get(m.group(), m.group()), field)
 
 
 class TaskScheduler:
@@ -70,19 +87,26 @@ class TaskScheduler:
         logger.info("Task added: %s (%s) by %s", task_id, name, owner_id)
         return task_id
 
-    async def remove_task(self, task_id: str, owner_id: str | None = None):
+    async def remove_task(self, task_id: str, owner_id: str | None = None) -> bool:
         db = await get_db()
 
         if owner_id:
-            await db.execute(
-                "UPDATE tasks SET status = 'deleted' WHERE id = ? AND owner_id = ?",
+            cur = await db.execute(
+                "UPDATE tasks SET status = 'deleted' WHERE id = ? AND owner_id = ? AND status = 'active'",
                 (task_id, owner_id),
             )
         else:
-            await db.execute(
-                "UPDATE tasks SET status = 'deleted' WHERE id = ?", (task_id,)
+            cur = await db.execute(
+                "UPDATE tasks SET status = 'deleted' WHERE id = ? AND status = 'active'",
+                (task_id,),
             )
         await db.commit()
+
+        if cur.rowcount == 0:
+            logger.warning(
+                "Task remove rejected: %s (owner mismatch or already deleted)", task_id
+            )
+            return False
 
         try:
             self._scheduler.remove_job(task_id)
@@ -90,6 +114,7 @@ class TaskScheduler:
             pass
 
         logger.info("Task removed: %s", task_id)
+        return True
 
     async def list_tasks(self, owner_id: str | None = None) -> list[dict]:
         db = await get_db()
@@ -129,7 +154,13 @@ class TaskScheduler:
             trigger = CronTrigger(
                 minute=cron_parts[0], hour=cron_parts[1],
                 day=cron_parts[2], month=cron_parts[3],
-                day_of_week=cron_parts[4],
+                day_of_week=_normalize_dow(cron_parts[4]),
+            )
+        elif len(cron_parts) == 6:
+            trigger = CronTrigger(
+                second=cron_parts[0], minute=cron_parts[1], hour=cron_parts[2],
+                day=cron_parts[3], month=cron_parts[4],
+                day_of_week=_normalize_dow(cron_parts[5]),
             )
         else:
             trigger = CronTrigger.from_crontab(cron_expr)
