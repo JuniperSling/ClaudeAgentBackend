@@ -12,7 +12,7 @@ from claude_agent_sdk import (
     create_sdk_mcp_server,
 )
 
-from src.config import get_config, get_env, get_active_model, get_model_env
+from src.config import get_config, get_env, get_active_model, get_model_env, MODEL_PRESETS
 from src.agent.tools import ALL_TOOLS, MCP_SERVER_NAME, TOOL_NAMES, set_context
 
 logger = logging.getLogger(__name__)
@@ -74,15 +74,20 @@ class AgentRunner:
         os.makedirs(user_workspace, exist_ok=True)
 
         active_model = get_active_model()
-        base_url, api_key = get_model_env(active_model)
+        base_url, api_key, needs_proxy = get_model_env(active_model)
         os.environ["ANTHROPIC_BASE_URL"] = base_url
         os.environ["ANTHROPIC_API_KEY"] = api_key
+        os.environ.pop("HTTPS_PROXY", None)
+        os.environ.pop("HTTP_PROXY", None)
+
+        preset = MODEL_PRESETS.get(active_model)
+        sdk_model_name = preset.name if preset else active_model
 
         sys_prompt = system_prompt or SYSTEM_PROMPT
-        logger.info("Using model: %s, resume=%s", active_model, resume_session_id[:8] if resume_session_id else None)
+        logger.info("Using model: %s (%s), resume=%s", active_model, sdk_model_name, resume_session_id[:8] if resume_session_id else None)
 
         options_kwargs = dict(
-            model=active_model,
+            model=sdk_model_name,
             max_turns=self.config.model.max_turns,
             permission_mode="bypassPermissions",
             cwd=user_workspace,
@@ -115,8 +120,10 @@ class AgentRunner:
                     else:
                         await on_progress("heartbeat", f"⏳ 处理中... ({elapsed}s)")
 
-        try:
-            async with ClaudeSDKClient(options=options) as client:
+        async def _run_client(opts):
+            nonlocal result_text, new_session_id, turn_count, last_tool_use
+            nonlocal last_event_time, heartbeat_task, last_thinking
+            async with ClaudeSDKClient(options=opts) as client:
                 await client.query(user_message)
                 heartbeat_task = asyncio.create_task(_heartbeat())
 
@@ -166,6 +173,12 @@ class AgentRunner:
                                     "Edit": "✏️ 编辑文件",
                                     "Glob": "🔍 搜索文件",
                                     "Grep": "🔍 搜索内容",
+                                    "Skill": "🎯 使用技能",
+                                    "Task": "🤖 子任务",
+                                    "WebSearch": "🔍 搜索网页",
+                                    "WebFetch": "🌐 获取网页",
+                                    "TodoWrite": "📝 任务清单",
+                                    "NotebookEdit": "📓 编辑笔记本",
                                 }
                                 label = mcp_labels.get(tool_name) or builtin_labels.get(tool_name) or f"🔧 {tool_name}"
 
@@ -209,9 +222,21 @@ class AgentRunner:
                             (new_session_id or "")[:12],
                         )
 
+        try:
+            await _run_client(options)
         except Exception as e:
-            logger.error("Agent error: %s", e, exc_info=True)
-            result_text = f"抱歉，处理消息时出错了: {type(e).__name__}"
+            if resume_session_id and "conversation" in str(e).lower():
+                logger.warning("Resume failed (session lost), retrying without resume: %s", e)
+                options_kwargs.pop("resume", None)
+                fallback_options = ClaudeAgentOptions(**options_kwargs)
+                try:
+                    await _run_client(fallback_options)
+                except Exception as e2:
+                    logger.error("Agent error (retry): %s", e2, exc_info=True)
+                    result_text = f"抱歉，处理消息时出错了: {type(e2).__name__}"
+            else:
+                logger.error("Agent error: %s", e, exc_info=True)
+                result_text = f"抱歉，处理消息时出错了: {type(e).__name__}"
         finally:
             if heartbeat_task:
                 heartbeat_task.cancel()

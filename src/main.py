@@ -13,6 +13,7 @@ from src.channels.base import IncomingMessage
 from src.channels.qq.bot import QQBot
 from src.scheduler.manager import TaskScheduler
 from src.services.internal_api import start_internal_api, stop_internal_api
+from src.services.openrouter_proxy import start_openrouter_proxy, stop_openrouter_proxy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,12 +59,14 @@ class Application:
         await self.scheduler.start()
 
         start_internal_api(self)
+        start_openrouter_proxy()
 
         logger.info("Application started successfully")
 
     async def stop(self):
         logger.info("Shutting down...")
         stop_internal_api()
+        stop_openrouter_proxy()
         if self.qq_bot:
             await self.qq_bot.stop()
         if self.scheduler:

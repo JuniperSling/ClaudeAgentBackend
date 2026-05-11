@@ -11,6 +11,7 @@ class ModelPreset(BaseModel):
     display_name: str = ""
     base_url: str = ""
     api_key_env: str = ""
+    needs_proxy: bool = False
 
 
 MODEL_PRESETS: dict[str, ModelPreset] = {
@@ -38,11 +39,25 @@ MODEL_PRESETS: dict[str, ModelPreset] = {
         base_url="https://api.deepseek.com/anthropic",
         api_key_env="DEEPSEEK_API_KEY",
     ),
+    "claude-opus-4.7": ModelPreset(
+        name="anthropic/claude-opus-4.7",
+        display_name="Claude Opus 4.7 (OpenRouter)",
+        base_url="http://127.0.0.1:9198",
+        api_key_env="OPENROUTER_API_KEY",
+        needs_proxy=True,
+    ),
+    "claude-sonnet-4.6": ModelPreset(
+        name="anthropic/claude-sonnet-4.6",
+        display_name="Claude Sonnet 4.6 (OpenRouter)",
+        base_url="http://127.0.0.1:9198",
+        api_key_env="OPENROUTER_API_KEY",
+        needs_proxy=True,
+    ),
 }
 
 
 class ModelConfig(BaseModel):
-    name: str = "deepseek-v4-flash"
+    name: str = "claude-sonnet-4.6"
     max_turns: int = 30
 
 
@@ -64,6 +79,7 @@ class SchedulerConfig(BaseModel):
 class EnvSettings(BaseSettings):
     zhipu_api_key: str = ""
     deepseek_api_key: str = ""
+    openrouter_api_key: str = ""
     serper_api_key: str = ""
     admin_qq_id: str = ""
     admin_password: str = "changeme"
@@ -130,15 +146,15 @@ def set_active_model(model_name: str):
     _active_model = model_name
 
 
-def get_model_env(model_name: str) -> tuple[str, str]:
-    """Returns (base_url, api_key) for a given model name."""
+def get_model_env(model_name: str) -> tuple[str, str, bool]:
+    """Returns (base_url, api_key, needs_proxy) for a given model name."""
     preset = MODEL_PRESETS.get(model_name)
     if not preset:
         preset = MODEL_PRESETS.get(get_config().model.name)
     env = get_env()
     base_url = preset.base_url
     api_key = getattr(env, preset.api_key_env.lower(), "") if preset.api_key_env else ""
-    return base_url, api_key
+    return base_url, api_key, preset.needs_proxy
 
 
 def init_config(config_path: str | None = None):
@@ -147,6 +163,6 @@ def init_config(config_path: str | None = None):
     _config = load_config(config_path)
     _active_model = _config.model.name
 
-    base_url, api_key = get_model_env(_active_model)
+    base_url, api_key, _ = get_model_env(_active_model)
     os.environ["ANTHROPIC_BASE_URL"] = base_url
     os.environ["ANTHROPIC_API_KEY"] = api_key

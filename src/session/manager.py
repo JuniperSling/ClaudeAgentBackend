@@ -109,3 +109,17 @@ class SessionManager:
             (agent_session_id, session_id),
         )
         await db.commit()
+
+    def clear_all_agent_sessions(self):
+        """Synchronously clear all agent_session_ids (used on model switch)."""
+        import asyncio
+        async def _clear():
+            db = await get_db()
+            await db.execute("UPDATE sessions SET agent_session_id = NULL")
+            await db.commit()
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_clear())
+        except RuntimeError:
+            asyncio.run(_clear())
+        logger.info("All agent sessions cleared (model switch)")

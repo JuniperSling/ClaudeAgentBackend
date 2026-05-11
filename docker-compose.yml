@@ -20,9 +20,14 @@ services:
     restart: always
     env_file:
       - .env
+    environment:
+      - PROXY_URL=http://host.docker.internal:10809
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./config:/app/config:ro
       - ./src:/app/src:ro
+      - ./skills:/home/agent/.claude/skills:ro
       - agent_data:/app/data
       - napcat_data:/napcat_files:ro
     depends_on:
